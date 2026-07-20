@@ -1,0 +1,20 @@
+.pytest_cache/
+.ruff_cache/
+__pycache__/
+*.py[cod]
+.venv/
+build/
+dist/
+*.egg-info/
+
+# Local/private data and generated artifacts
+data/
+outputs/
+configs/local.yaml
+*.sqlite
+*.db
+*.parquet
+*.feather
+*.pkl
+*.zip
+
