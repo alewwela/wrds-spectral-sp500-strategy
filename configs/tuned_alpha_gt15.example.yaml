@@ -1,5 +1,6 @@
+# In-sample tuned specification found by scripts/tune_sp500_parameters.py.
 # Copy to configs/local.yaml and adjust paths for your machine.
-# WRDS/CRSP/Compustat data files are intentionally not committed.
+# This intentionally changes the original fixed top-10 strategy to top 3.
 
 pit_universe_repo: ../data/wrds-pit-market-cap-universe
 returns_path: ../data/wrds_spectral_export/crsp_monthly_adjusted_returns.csv
@@ -8,15 +9,15 @@ risk_free_path: ../data/risk_free_monthly_returns.csv
 factor_paths:
   - ../data/wrds_spectral_export/wrds_factor_value.csv
 
-output_dir: ../outputs/current_fixed_top10_sp500
+output_dir: ../outputs/tuned_sp500_alpha_gt15
 
 start_year: 1996
 oos_start_year: 2001
 oos_end_year: 2025
 end_date: "2025-12-31"
 
-rebalance_periods: ["3M", "6M", "1Y"]
-top_n: 10
+rebalance_periods: ["1Y"]
+top_n: 3
 windows: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
           11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
           21, 22, 23, 24, 25, 26, 27, 28, 29, 30,
@@ -35,13 +36,11 @@ positive_only_affinity: true
 min_cluster_size: 8
 
 score_weights:
-  EarningsYield: -3.0
-  ValueScore: 1.0
-  ret_horizon_vol_60m: -1.0
-  cluster_resid_ret_11m: 2.0
+  EarningsYield: -0.5
+  ret_13m: 1.0
 
 gate:
-  enabled: true
+  enabled: false
   train_start_year: 1996
   top_score_quantile: 0.85
   median_worst_quantile: 0.80

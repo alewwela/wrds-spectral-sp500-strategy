@@ -45,6 +45,25 @@ Copy-Item configs\local.example.yaml configs\local.yaml
 
 Outputs are written under `outputs/current_fixed_top10_sp500/`.
 
+## In-Sample Tuned Alpha Search
+
+`scripts/tune_sp500_parameters.py` searches PIT-safe score parameters and writes
+diagnostics under `outputs/tuned_sp500_alpha_search/`.
+
+The checked-in tuned example is `configs/tuned_alpha_gt15.example.yaml`. It is
+not the original fixed top-10 strategy: it changes concentration to top 3,
+uses yearly rebalancing, disables the cash gate, and scores names as:
+
+```text
+-0.5 * EarningsYield
++1.0 * ret_13m
+```
+
+On the local 2001-2025 PIT S&P 500 backtest, that in-sample tuned
+specification produced 27.25% CAGR versus 9.82% for SPY, or 17.43% simple
+annualized alpha. Treat this as data-mined research output until it survives a
+separate validation protocol.
+
 ## PIT Safety
 
 - S&P 500 source snapshots are selected with `source date <= signal date`.

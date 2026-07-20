@@ -18,6 +18,32 @@ def apply_expanding_gate(
     frame = raw_returns.copy()
     frame.loc[:, "Date"] = pd.to_datetime(frame["Date"])
     frame.loc[:, "SignalDate"] = pd.to_datetime(frame["SignalDate"])
+    if not gate.enabled:
+        frame = frame.loc[frame["Date"].dt.year.between(oos_start_year, oos_end_year)].copy()
+        frame.loc[:, "TopScoreThreshold"] = np.nan
+        frame.loc[:, "MedianWorstThreshold"] = np.nan
+        frame.loc[:, "GatePassed"] = True
+        frame.loc[:, "PortfolioReturn"] = frame["RawPortfolioReturn"]
+        frame.loc[:, "GrossExposure"] = 1.0
+        frame.loc[:, "NetExposure"] = 1.0
+        frame.loc[:, "ActiveNames"] = frame["RawActiveNames"]
+        thresholds = pd.DataFrame(
+            [
+                {
+                    "OOSYear": year,
+                    "TrainStartYear": gate.train_start_year,
+                    "TrainEndYear": year - 1,
+                    "GateEnabled": False,
+                    "TrainSignalCount": 0,
+                    "TopScoreQuantile": np.nan,
+                    "TopScoreThreshold": np.nan,
+                    "MedianWorstQuantile": np.nan,
+                    "MedianWorstThreshold": np.nan,
+                }
+                for year in range(oos_start_year, oos_end_year + 1)
+            ]
+        )
+        return frame.sort_values("Date"), thresholds
     out_frames: list[pd.DataFrame] = []
     threshold_rows: list[dict[str, object]] = []
     for year in range(oos_start_year, oos_end_year + 1):

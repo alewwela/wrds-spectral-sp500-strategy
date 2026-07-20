@@ -54,3 +54,28 @@ def test_expanding_gate_uses_prior_years_only() -> None:
     assert threshold_2003["TopScoreThreshold"] < 100.0
     assert threshold_2003["MedianWorstThreshold"] < 100.0
     assert not bool(gated.loc[gated["Date"].eq(pd.Timestamp("2003-01-31")), "GatePassed"].item())
+
+
+def test_disabled_gate_stays_fully_invested_for_oos_rows() -> None:
+    raw = pd.DataFrame(
+        {
+            "SignalDate": pd.to_datetime(["2000-12-31", "2001-12-31"]),
+            "Date": pd.to_datetime(["2001-01-31", "2002-01-31"]),
+            "RawPortfolioReturn": [0.1, -0.2],
+            "RawActiveNames": [3, 3],
+            "top_score": [1.0, 2.0],
+            "median_ret_horizon_worst_60m": [1.0, 2.0],
+        }
+    )
+
+    gated, thresholds = apply_expanding_gate(
+        raw,
+        GateConfig(enabled=False),
+        oos_start_year=2001,
+        oos_end_year=2002,
+    )
+
+    assert gated["GatePassed"].tolist() == [True, True]
+    assert gated["PortfolioReturn"].tolist() == [0.1, -0.2]
+    assert gated["ActiveNames"].tolist() == [3, 3]
+    assert thresholds["GateEnabled"].tolist() == [False, False]

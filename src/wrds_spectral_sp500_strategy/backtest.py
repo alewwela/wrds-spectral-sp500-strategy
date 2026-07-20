@@ -279,12 +279,17 @@ def build_signal(
         base_audit.update({"FeatureEligibleCount": int(len(features))})
         return empty_signal(signal_date, mapped.source_snapshot_date, mapped, base_audit, "insufficient_return_history")
 
-    clusters = cluster_returns(
-        features,
-        n_clusters=config.n_clusters,
-        nearest_neighbors=config.nearest_neighbors,
-        random_state=config.random_state,
-        positive_only=config.positive_only_affinity,
+    residual_columns = cluster_residual_source_columns(config.score_weights)
+    clusters = (
+        cluster_returns(
+            features,
+            n_clusters=config.n_clusters,
+            nearest_neighbors=config.nearest_neighbors,
+            random_state=config.random_state,
+            positive_only=config.positive_only_affinity,
+        )
+        if residual_columns
+        else pd.Series(index=features.index, dtype="float64", name="Cluster")
     )
     factor_scores = select_factor_scores_as_of(
         factors,
@@ -299,7 +304,7 @@ def build_signal(
     score_inputs = augment_cluster_features(
         augment_return_features(features),
         clusters,
-        residual_columns=("ret_11m",),
+        residual_columns=residual_columns,
     ).join(factor_scores, how="left")
     try:
         scores = fixed_rule_score(score_inputs, config.score_weights)
@@ -448,6 +453,16 @@ def metric_median(frame: pd.DataFrame, column: str) -> float:
     return float(frame[column].median(skipna=True))
 
 
+def cluster_residual_source_columns(weights: dict[str, float]) -> tuple[str, ...]:
+    prefix = "cluster_resid_"
+    columns = [
+        column.removeprefix(prefix)
+        for column in weights
+        if column.startswith(prefix)
+    ]
+    return tuple(dict.fromkeys(columns))
+
+
 def compare_with_broad_universe(summary: pd.DataFrame) -> pd.DataFrame:
     rows: list[dict[str, object]] = []
     if summary.empty:
@@ -491,7 +506,7 @@ def write_run_summary(
     signal_audit: pd.DataFrame,
 ) -> None:
     payload = {
-        "method": "current_fixed_top10_spectral_sp500_pit",
+        "method": "pit_sp500_equal_weight_score_backtest",
         "top_n": config.top_n,
         "portfolio": "long-only, unlevered, equal-weight, no shorts, no leverage",
         "score_weights": config.score_weights,
@@ -533,15 +548,15 @@ def write_report(
     audit: pd.DataFrame,
 ) -> None:
     lines = [
-        "# Current Fixed Top-10 Spectral Strategy on PIT S&P 500",
+        "# PIT S&P 500 Strategy Backtest",
         "",
         "## Setup",
         "",
         "- Universe: pinned `fja05680/sp500` PIT constituent snapshots, mapped to WRDS PERMNOs using CRSP CIZ historical audit tickers as of each signal date.",
-        "- Portfolio: long-only, unlevered, equal-weight top 10.",
-        "- Rebalance periods: 3M, 6M, 1Y.",
-        "- Score: `-3.0 * EarningsYield + 1.0 * ValueScore - 1.0 * ret_horizon_vol_60m + 2.0 * cluster_resid_ret_11m`, with each input cross-sectionally z-scored.",
-        "- Gate: invest only when selected `top_score` is below the prior-year expanding 85th percentile and universe median `ret_horizon_worst_60m` is below the prior-year expanding 80th percentile.",
+        f"- Portfolio: long-only, unlevered, equal-weight top {config.top_n}.",
+        f"- Rebalance periods: {', '.join(config.rebalance_periods)}.",
+        f"- Score weights: `{json.dumps(config.score_weights, sort_keys=True)}`, with each input cross-sectionally z-scored.",
+        f"- Gate: {gate_description(config.gate)}",
         "- OOS window: 2001-2025, when data supports the signal and forward-return window.",
         "",
         "## Summary",
@@ -585,9 +600,9 @@ def write_report(
         "",
         "## Screener / Forward Test",
         "",
-        "For a new signal date, load the latest source snapshot with `date <= signal date`, map source tickers to WRDS PERMNOs using only identifier rows dated at or before the signal, compute trailing return features from returns strictly before the signal, select PIT factor rows with `Date <= signal date` and `DataAvailableDate <= signal date`, score the cross-section, and apply the saved expanding gate thresholds trained through the prior completed year.",
+        screener_description(config),
         "",
-        "The selected names for historical signals are in `selected_holdings.csv`. `gate_thresholds.csv` in each rebalance-period directory records the annual expanding thresholds used for each OOS year.",
+        "The selected names for historical signals are in `selected_holdings.csv`. `gate_thresholds.csv` in each rebalance-period directory records the annual expanding thresholds used for each OOS year when the gate is enabled.",
         "",
         "## Look-Ahead Assessment",
         "",
@@ -608,7 +623,7 @@ def write_report(
         "- `comparison_against_broad_universe.csv`",
         "- `signal_audit.csv`",
         "- `selected_holdings.csv`",
-        "- `3M/`, `6M/`, `1Y/` period-specific returns, thresholds, and performance files",
+        f"- Period directories: {', '.join(f'`{period}/`' for period in config.rebalance_periods)}",
         "",
     ]
     if not audit.empty:
@@ -648,7 +663,7 @@ def markdown_table(frame: pd.DataFrame, columns: list[str]) -> str:
     present = [column for column in columns if column in frame.columns]
     if not present:
         return "_No requested columns._"
-    out = frame[present].copy()
+    out = frame[present].copy().astype(object)
     percent_columns = {
         column
         for column in out.columns
@@ -666,6 +681,33 @@ def markdown_table(frame: pd.DataFrame, columns: list[str]) -> str:
     separator = "| " + " | ".join(["---"] * len(out.columns)) + " |"
     body = ["| " + " | ".join(row) + " |" for row in out.astype(str).to_numpy()]
     return "\n".join([header, separator, *body])
+
+
+def gate_description(gate) -> str:
+    if not gate.enabled:
+        return "disabled; the strategy stays fully invested when a valid signal exists."
+    return (
+        f"invest only when selected `top_score` is {gate.top_score_operator} the "
+        f"prior-year expanding {gate.top_score_quantile:.0%} percentile and universe "
+        f"median `ret_horizon_worst_60m` is {gate.median_worst_operator} the "
+        f"prior-year expanding {gate.median_worst_quantile:.0%} percentile."
+    )
+
+
+def screener_description(config: StrategyConfig) -> str:
+    base = (
+        "For a new signal date, load the latest source snapshot with `date <= signal date`, "
+        "map source tickers to WRDS PERMNOs using only identifier rows dated at or before "
+        "the signal, compute trailing return features from returns strictly before the "
+        "signal, select PIT factor rows with `Date <= signal date` and "
+        "`DataAvailableDate <= signal date`, and score the cross-section."
+    )
+    if not config.gate.enabled:
+        return base + " The cash gate is disabled for this run."
+    return (
+        base
+        + " Apply the saved expanding gate thresholds trained through the prior completed year."
+    )
 
 
 def format_percent(value: object) -> str:

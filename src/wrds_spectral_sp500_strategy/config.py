@@ -20,6 +20,7 @@ DEFAULT_SCORE_WEIGHTS = {
 
 @dataclass(frozen=True)
 class GateConfig:
+    enabled: bool = True
     train_start_year: int = 1996
     top_score_quantile: float = 0.85
     median_worst_quantile: float = 0.80
@@ -119,6 +120,7 @@ class StrategyConfig:
                 for column, weight in raw.get("score_weights", DEFAULT_SCORE_WEIGHTS).items()
             },
             gate=GateConfig(
+                enabled=bool(gate_raw.get("enabled", True)),
                 train_start_year=int(gate_raw.get("train_start_year", 1996)),
                 top_score_quantile=float(gate_raw.get("top_score_quantile", 0.85)),
                 median_worst_quantile=float(gate_raw.get("median_worst_quantile", 0.80)),
@@ -142,4 +144,3 @@ class StrategyConfig:
 def resolve_path(value: object, base: Path) -> Path:
     path = Path(str(value))
     return path if path.is_absolute() else base / path
-
