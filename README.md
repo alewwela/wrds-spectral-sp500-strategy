@@ -47,27 +47,31 @@ Copy-Item configs\local.example.yaml configs\local.yaml
 
 Outputs are written under `outputs/current_fixed_top10_sp500/`.
 
-## In-Sample Tuned Alpha Search
+## Walk-Forward Tuned Search
 
 `scripts/tune_sp500_parameters.py` searches PIT-safe score parameters and writes
 diagnostics under `outputs/tuned_sp500_alpha_search/`.
 
-The checked-in tuned example is `configs/tuned_alpha_gt15.example.yaml`. It is
-not the original equal-weight fixed top-10 strategy: it keeps top 10 selected
-names, uses yearly rebalancing, disables the cash gate, applies rank-decay
-portfolio weights with `rank_decay: 0.60`, and scores names as:
+The checked-in tuned example is `configs/tuned_alpha_gt15.example.yaml`. The
+latest rerun selected parameters on 2001-2024 only, reserving 2025 for a
+walk-forward test. It is not the original equal-weight fixed top-10 strategy:
+it keeps top 10 selected names, uses yearly rebalancing, disables the cash gate,
+applies rank-decay portfolio weights with `rank_decay: 0.50`, and scores names
+as:
 
 ```text
 -0.5 * EarningsYield
 +1.0 * ret_13m
 ```
 
-On the local 2001-2025 PIT S&P 500 backtest, the validated top-10 rank-decay
-specification produced 25.71% CAGR versus 9.82% for SPY, or 15.89% simple
-annualized alpha. The equal-weight top-10 searches plateaued below that target;
-the alpha target was cleared by changing the top-10 weighting scheme, not by
-finding an equal-weight top-10 rule. Treat this as data-mined research output
-until it survives a separate validation protocol.
+On the 2001-2024 selection window, this specification produced 27.34% CAGR
+versus 9.49% for SPY, or 17.84% simple annualized alpha. On the untouched 2025
+reserve year, it returned 24.48% versus 17.72% for SPY, or 6.76% simple alpha.
+The equal-weight top-10 training search topped out at 11.41% simple alpha.
+
+`configs/walk_forward_holdout.example.yaml` reproduces the 2025 reserve
+evaluation. See `docs/walk_forward_2025_selection.md` for the split, search
+passes, selected strategy, and reserve result.
 
 ## PIT Safety
 

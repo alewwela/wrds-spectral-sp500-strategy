@@ -1,6 +1,5 @@
-# Specification selected on the 2001-2024 training window by scripts/tune_sp500_parameters.py.
+# Walk-forward reserve evaluation for the strategy selected on 2001-2024.
 # Copy to configs/local.yaml and adjust paths for your machine.
-# 2025 is intentionally reserved for walk-forward testing.
 
 pit_universe_repo: ../data/wrds-pit-market-cap-universe
 returns_path: ../data/wrds_spectral_export/crsp_monthly_adjusted_returns.csv
@@ -8,12 +7,19 @@ benchmark_path: ../data/wrds_spectral_export/spy_monthly_returns.csv
 risk_free_path: ../data/risk_free_monthly_returns.csv
 factor_paths:
   - ../data/wrds_spectral_export/wrds_factor_value.csv
+  - ../data/wrds_spectral_export/wrds_factor_quality.csv
+  - ../data/wrds_spectral_export/wrds_factor_momentum.csv
+  - ../data/wrds_spectral_export/wrds_factor_growth.csv
+  - ../data/wrds_spectral_export/wrds_factor_balance_sheet.csv
+  - ../data/wrds_spectral_export/wrds_factor_capital_allocation.csv
+  - ../data/wrds_spectral_export/wrds_factor_risk.csv
+  - ../data/wrds_spectral_export/wrds_factor_liquidity.csv
 
-output_dir: ../outputs/walk_forward_2025/train_selected_rank_decay_0_50
+output_dir: ../outputs/walk_forward_2025/holdout_selected_rank_decay_0_50
 
 start_year: 1996
-oos_start_year: 2001
-oos_end_year: 2024
+oos_start_year: 2025
+oos_end_year: 2025
 end_date: "2025-12-31"
 
 rebalance_periods: ["1Y"]

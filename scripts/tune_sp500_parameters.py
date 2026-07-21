@@ -196,6 +196,12 @@ def main() -> int:
     output_dir = args.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
     config = StrategyConfig.from_yaml(args.config)
+    if args.oos_start_year is not None:
+        config = replace(config, oos_start_year=args.oos_start_year)
+    if args.oos_end_year is not None:
+        config = replace(config, oos_end_year=args.oos_end_year)
+    if args.end_date is not None:
+        config = replace(config, end_date=args.end_date)
     if args.top_n is not None:
         config = replace(config, top_n=args.top_n)
     if args.min_history_months is not None:
@@ -316,7 +322,7 @@ def main() -> int:
         str(best["RebalancePeriod"]),
         output_dir,
     )
-    write_report(output_dir, metrics, best_candidate, best_policy, tuned_config)
+    write_report(output_dir, metrics, best_candidate, best_policy, tuned_config, config)
 
     display = metrics[
         [
@@ -358,6 +364,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--random-candidates", type=int, default=1200)
     parser.add_argument("--seed", type=int, default=17)
     parser.add_argument("--show", type=int, default=12)
+    parser.add_argument("--oos-start-year", type=int, default=None)
+    parser.add_argument("--oos-end-year", type=int, default=None)
+    parser.add_argument("--end-date", default=None)
     parser.add_argument(
         "--periods",
         default="3M,6M,1Y",
@@ -673,6 +682,14 @@ def domain_composites() -> list[Candidate]:
                 "QualityScore": 3.0,
                 "ValueScore": 2.0,
                 "AccrualsToAssets": -2.0,
+            },
+        ),
+        Candidate(
+            "earnings_yield_ret13",
+            "domain_composite",
+            {
+                "EarningsYield": -0.5,
+                "ret_13m": 1.0,
             },
         ),
         Candidate(
@@ -1049,6 +1066,10 @@ def write_tuned_config(
     output_dir: Path,
 ) -> Path:
     raw = yaml.safe_load((ROOT / "configs" / "local.example.yaml").read_text(encoding="utf-8"))
+    raw["start_year"] = config.start_year
+    raw["oos_start_year"] = config.oos_start_year
+    raw["oos_end_year"] = config.oos_end_year
+    raw["end_date"] = config.end_date
     raw["rebalance_periods"] = [period]
     raw["top_n"] = config.top_n
     raw["min_history_months"] = config.min_history_months
@@ -1087,13 +1108,20 @@ def write_report(
     candidate: Candidate,
     policy: GatePolicy,
     tuned_config: Path,
+    config: StrategyConfig,
 ) -> None:
     best = metrics.iloc[0]
+    start_date = pd.to_datetime(best["StartDate"]).date()
+    end_date = pd.to_datetime(best["EndDate"]).date()
     lines = [
         "# PIT S&P 500 Parameter Tuning",
         "",
-        "This search intentionally optimized against the full 2001-2025 backtest window.",
-        "Treat the winning specification as in-sample tuned, not validated alpha.",
+        (
+            f"This search optimized only against the configured "
+            f"{config.oos_start_year}-{config.oos_end_year} OOS window "
+            f"({start_date} through {end_date})."
+        ),
+        "Treat the winning specification as tuned research output until it survives a separate reserve or live validation window.",
         "",
         "## Best Candidate",
         "",
