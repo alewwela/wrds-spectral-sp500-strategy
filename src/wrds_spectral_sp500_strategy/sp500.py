@@ -177,18 +177,20 @@ def map_snapshot_to_permnos(
             ambiguous.append(source_symbol)
             continue
         row = candidates.iloc[0]
-        rows.append(
-            {
-                "SignalDate": snapshot.signal_date,
-                "SourceSnapshotDate": snapshot.source_snapshot_date,
-                "SourceSymbol": source_symbol,
-                "PERMNO": int(row["PERMNO"]),
-                "MatchedFeedSymbol": row["FeedSymbol"],
-                "MatchedYFTicker": row["YFTicker"],
-                "MatchedSecurity": row["Security"],
-                "IdentifierDate": row["Date"],
-            }
-        )
+        mapped_row = {
+            "SignalDate": snapshot.signal_date,
+            "SourceSnapshotDate": snapshot.source_snapshot_date,
+            "SourceSymbol": source_symbol,
+            "PERMNO": int(row["PERMNO"]),
+            "MatchedFeedSymbol": row["FeedSymbol"],
+            "MatchedYFTicker": row["YFTicker"],
+            "MatchedSecurity": row["Security"],
+            "IdentifierDate": row["Date"],
+        }
+        for column in ("MarketCap", "Exchange", "SIC"):
+            if column in row.index:
+                mapped_row[column] = row[column]
+        rows.append(mapped_row)
     mapped_frame = pd.DataFrame(rows)
     duplicate_permnos: tuple[int, ...] = ()
     if not mapped_frame.empty:
@@ -277,4 +279,3 @@ def source_metadata(
 
 def unique_signal_dates(dates: Iterable[pd.Timestamp]) -> tuple[pd.Timestamp, ...]:
     return tuple(pd.Timestamp(date) for date in sorted(set(pd.to_datetime(list(dates)))))
-

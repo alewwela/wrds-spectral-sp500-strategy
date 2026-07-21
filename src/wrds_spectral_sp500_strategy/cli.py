@@ -9,7 +9,7 @@ from wrds_spectral_sp500_strategy.config import StrategyConfig
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Run the fixed top-10 spectral strategy on PIT S&P 500 constituents."
+        description="Run the fixed spectral strategy on a PIT S&P 500 or broad WRDS universe."
     )
     parser.add_argument(
         "--config",
@@ -39,4 +39,3 @@ def main(argv: list[str] | None = None) -> int:
         ]
         print(display.to_string(index=False))
     return 0
-

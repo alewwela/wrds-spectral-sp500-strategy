@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "wrds-spectral-sp500-strategy"
 version = "0.1.0"
-description = "PIT S&P 500 fixed top-10 WRDS spectral strategy backtest."
+description = "PIT S&P 500 and broad WRDS spectral strategy backtests."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -24,4 +24,3 @@ wrds-spectral-sp500-backtest = "wrds_spectral_sp500_strategy.cli:main"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
-

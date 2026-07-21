@@ -42,6 +42,18 @@ class MappingConfig:
 
 
 @dataclass(frozen=True)
+class SectorControlConfig:
+    enabled: bool = False
+    column: str = "SIC"
+    sic_digits: int = 2
+    max_per_group: int | None = None
+    min_groups: int = 0
+    neutralize_scores: bool = False
+    bucket_column: str | None = None
+    bucket_count: int = 10
+
+
+@dataclass(frozen=True)
 class StrategyConfig:
     pit_universe_repo: Path
     returns_path: Path
@@ -49,6 +61,7 @@ class StrategyConfig:
     risk_free_path: Path | None = None
     factor_paths: tuple[Path, ...] = ()
     output_dir: Path = Path("outputs/current_fixed_top10_sp500")
+    universe_mode: str = "sp500"
     start_year: int = 1996
     oos_start_year: int = 2001
     oos_end_year: int = 2025
@@ -71,6 +84,7 @@ class StrategyConfig:
     gate: GateConfig = GateConfig()
     sp500_source: Sp500SourceConfig = Sp500SourceConfig()
     mapping: MappingConfig = MappingConfig()
+    sector_control: SectorControlConfig = SectorControlConfig()
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> "StrategyConfig":
@@ -95,11 +109,15 @@ class StrategyConfig:
         gate_raw = raw.get("gate", {}) or {}
         source_raw = raw.get("sp500_source", {}) or {}
         mapping_raw = raw.get("mapping", {}) or {}
+        sector_raw = raw.get("sector_control", {}) or {}
         factor_paths = tuple(resolve_path(value, base) for value in raw.get("factor_paths", []) or [])
         windows = tuple(int(value) for value in raw.get("windows", DEFAULT_WINDOWS))
         if not windows:
             raise ValueError("windows cannot be empty")
         periods = tuple(str(value).upper() for value in raw.get("rebalance_periods", ("3M", "6M", "1Y")))
+        universe_mode = str(raw.get("universe_mode", "sp500")).lower().replace("-", "_")
+        if universe_mode not in {"sp500", "broad_wrds"}:
+            raise ValueError("universe_mode must be one of: sp500, broad_wrds")
         return cls(
             pit_universe_repo=required_path("pit_universe_repo"),
             returns_path=required_path("returns_path"),
@@ -107,6 +125,7 @@ class StrategyConfig:
             risk_free_path=optional_path("risk_free_path"),
             factor_paths=factor_paths,
             output_dir=resolve_path(raw.get("output_dir", "outputs/current_fixed_top10_sp500"), base),
+            universe_mode=universe_mode,
             start_year=int(raw.get("start_year", 1996)),
             oos_start_year=int(raw.get("oos_start_year", 2001)),
             oos_end_year=int(raw.get("oos_end_year", 2025)),
@@ -157,6 +176,24 @@ class StrategyConfig:
                 max_identifier_staleness_days=int(
                     mapping_raw.get("max_identifier_staleness_days", 95)
                 )
+            ),
+            sector_control=SectorControlConfig(
+                enabled=bool(sector_raw.get("enabled", False)),
+                column=str(sector_raw.get("column", "SIC")),
+                sic_digits=int(sector_raw.get("sic_digits", 2)),
+                max_per_group=(
+                    None
+                    if sector_raw.get("max_per_group") is None
+                    else int(sector_raw.get("max_per_group"))
+                ),
+                min_groups=int(sector_raw.get("min_groups", 0)),
+                neutralize_scores=bool(sector_raw.get("neutralize_scores", False)),
+                bucket_column=(
+                    None
+                    if not sector_raw.get("bucket_column")
+                    else str(sector_raw.get("bucket_column"))
+                ),
+                bucket_count=int(sector_raw.get("bucket_count", 10)),
             ),
         )
 

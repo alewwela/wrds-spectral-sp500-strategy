@@ -216,16 +216,31 @@ def load_identifier_history(
     *,
     manifest_path: str = "datasets/wrds_crsp_ciz_monthly_return_panel_chunks.json",
 ) -> pd.DataFrame:
-    columns = ["Date", "PERMNO", "FeedSymbol", "Security"]
-    frame = read_chunk_manifest(pit_universe_repo, manifest_path, usecols=columns)
+    required = ["Date", "PERMNO", "FeedSymbol", "Security"]
+    optional = ["MarketCap", "Exchange", "SIC"]
+    frame = read_chunk_manifest(pit_universe_repo, manifest_path)
+    missing = set(required) - set(frame.columns)
+    if missing:
+        raise ValueError(f"Identifier history missing required columns: {sorted(missing)}")
+    available = [column for column in [*required, *optional] if column in frame.columns]
+    frame = frame[available].copy()
     frame = normalize_dates(frame)
     if "YFTicker" not in frame.columns:
         frame.loc[:, "YFTicker"] = ""
     frame.loc[:, "PERMNO"] = pd.to_numeric(frame["PERMNO"], errors="coerce")
     frame = frame.dropna(subset=["Date", "PERMNO"]).copy()
     frame.loc[:, "PERMNO"] = frame["PERMNO"].astype("int64")
-    for column in ("FeedSymbol", "YFTicker", "Security"):
-        frame.loc[:, column] = frame[column].fillna("").astype(str)
+    assignments = {
+        column: frame[column].fillna("").astype(str)
+        for column in ("FeedSymbol", "YFTicker", "Security")
+    }
+    if "Exchange" in frame.columns:
+        assignments["Exchange"] = frame["Exchange"].fillna("").astype(str)
+    if "SIC" in frame.columns:
+        assignments["SIC"] = frame["SIC"].fillna("").astype(str)
+    if "MarketCap" in frame.columns:
+        assignments["MarketCap"] = pd.to_numeric(frame["MarketCap"], errors="coerce")
+    frame = frame.assign(**assignments)
     return frame.sort_values(["PERMNO", "Date"]).drop_duplicates(
         ["PERMNO", "Date"], keep="last"
     )

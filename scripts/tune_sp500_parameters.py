@@ -17,7 +17,12 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from wrds_spectral_sp500_strategy.backtest import benchmark_signal_metrics, metric_median
+from wrds_spectral_sp500_strategy.backtest import (
+    benchmark_signal_metrics,
+    build_universe,
+    metric_median,
+    sector_factor_columns,
+)
 from wrds_spectral_sp500_strategy.clustering import cluster_returns
 from wrds_spectral_sp500_strategy.config import GateConditionConfig, GateConfig, StrategyConfig
 from wrds_spectral_sp500_strategy.data import (
@@ -35,18 +40,19 @@ from wrds_spectral_sp500_strategy.features import (
     zscore_columns,
 )
 from wrds_spectral_sp500_strategy.gates import apply_expanding_gate
-from wrds_spectral_sp500_strategy.performance import attach_optional_series, performance_summary
+from wrds_spectral_sp500_strategy.objectives import OBJECTIVES, sort_by_selection_score
+from wrds_spectral_sp500_strategy.performance import attach_optional_series, compound, performance_summary
 from wrds_spectral_sp500_strategy.portfolio import portfolio_weights
 from wrds_spectral_sp500_strategy.rebalance import (
     holding_period_dates,
     period_frequency,
     select_rebalance_dates,
 )
+from wrds_spectral_sp500_strategy.selection import build_group_labels, select_scores
 from wrds_spectral_sp500_strategy.sp500 import (
     load_configured_source,
-    map_snapshot_to_permnos,
-    snapshot_as_of,
 )
+from wrds_spectral_sp500_strategy.walk_forward import rolling_year_splits
 
 
 FUNDAMENTAL_COLUMNS: tuple[str, ...] = (
@@ -184,6 +190,7 @@ class SignalSlice:
     signal_date: pd.Timestamp
     source_snapshot_date: pd.Timestamp
     scores: pd.DataFrame
+    group_labels: pd.Series | None
     median_worst_60m: float
     raw_universe_count: int
     mapped_universe_count: int
@@ -216,6 +223,10 @@ def main() -> int:
         config = replace(config, portfolio_weighting=args.portfolio_weighting)
     if args.rank_decay is not None:
         config = replace(config, rank_decay=args.rank_decay)
+    top_n_values = parse_top_n_values(args.top_n_values, config.top_n)
+    if args.top_n is not None and args.top_n_values is None:
+        top_n_values = (args.top_n,)
+    config = replace(config, top_n=min(top_n_values))
 
     returns = load_returns(config.returns_path)
     benchmark = load_benchmark(config.benchmark_path)
@@ -231,6 +242,7 @@ def main() -> int:
         seed=args.seed,
         include_cluster_residuals=args.include_cluster_residuals,
         feature_set=args.feature_set,
+        candidate_set=args.candidate_set,
     )
     if args.top_from_metrics is not None:
         keep_names = candidate_allowlist(args.top_from_metrics, args.top_count)
@@ -242,10 +254,15 @@ def main() -> int:
             for column in candidate.weights
             if not column.startswith("ret_") and not column.startswith("cluster_")
         }
+        | set(sector_factor_columns(config))
     )
     factors = load_factor_frames(config.factor_paths, factor_columns)
     identifier_history = load_identifier_history(config.pit_universe_repo)
-    sp500_source = load_configured_source(config.sp500_source)
+    sp500_source = (
+        load_configured_source(config.sp500_source)
+        if config.universe_mode == "sp500"
+        else pd.DataFrame()
+    )
 
     all_dates = pd.Series(returns["Date"].dropna().unique())
     all_dates = pd.to_datetime(all_dates).sort_values()
@@ -261,7 +278,7 @@ def main() -> int:
         {date for dates in rebalance_dates_by_period.values() for date in dates}
     )
     print(
-        f"building PIT S&P signal cache: {len(unique_rebalance_dates)} signal dates, "
+        f"building PIT {config.universe_mode} signal cache: {len(unique_rebalance_dates)} signal dates, "
         f"{len(candidates)} candidates",
         flush=True,
     )
@@ -289,6 +306,22 @@ def main() -> int:
         flush=True,
     )
     policies = build_gate_policies(args.gate_set)
+    if args.rolling_train_years is not None:
+        return run_rolling_mode(
+            config,
+            args,
+            output_dir,
+            available_candidates,
+            policies,
+            rebalance_dates_by_period,
+            signal_cache,
+            returns_by_date=returns_by_date,
+            return_dates=return_dates,
+            benchmark_metrics_by_signal=benchmark_metrics_by_signal,
+            benchmark=benchmark,
+            risk_free=risk_free,
+            top_n_values=top_n_values,
+        )
     metrics = run_screen(
         config,
         available_candidates,
@@ -300,11 +333,9 @@ def main() -> int:
         benchmark_metrics_by_signal=benchmark_metrics_by_signal,
         benchmark=benchmark,
         risk_free=risk_free,
+        top_n_values=top_n_values,
     )
-    metrics = metrics.sort_values(
-        ["SimpleAlphaAnnualized", "CAGR", "Sharpe"],
-        ascending=[False, False, False],
-    )
+    metrics = sort_by_selection_score(metrics, args.selection_objective)
     metrics.to_csv(output_dir / "candidate_metrics.csv", index=False)
     write_candidate_catalog(available_candidates, output_dir)
     if metrics.empty:
@@ -320,9 +351,18 @@ def main() -> int:
         best_candidate,
         best_policy,
         str(best["RebalancePeriod"]),
+        int(best["TopN"]),
         output_dir,
     )
-    write_report(output_dir, metrics, best_candidate, best_policy, tuned_config, config)
+    write_report(
+        output_dir,
+        metrics,
+        best_candidate,
+        best_policy,
+        tuned_config,
+        config,
+        selection_objective=args.selection_objective,
+    )
 
     display = metrics[
         [
@@ -330,6 +370,8 @@ def main() -> int:
             "Family",
             "GatePolicy",
             "RebalancePeriod",
+            "TopN",
+            "SelectionScore",
             "ActiveShare",
             "CAGR",
             "BenchmarkCAGR",
@@ -347,9 +389,274 @@ def main() -> int:
     return 0
 
 
+def run_rolling_mode(
+    config: StrategyConfig,
+    args: argparse.Namespace,
+    output_dir: Path,
+    available_candidates: list[Candidate],
+    policies: list[GatePolicy],
+    rebalance_dates_by_period: dict[str, list[pd.Timestamp]],
+    signal_cache: dict[pd.Timestamp, SignalSlice],
+    *,
+    returns_by_date: dict[pd.Timestamp, pd.Series],
+    return_dates: pd.Index,
+    benchmark_metrics_by_signal: dict[pd.Timestamp, dict[str, float]],
+    benchmark: pd.DataFrame,
+    risk_free: pd.DataFrame | None,
+    top_n_values: tuple[int, ...],
+) -> int:
+    splits = rolling_year_splits(
+        start_year=config.oos_start_year,
+        end_year=config.oos_end_year,
+        train_years=args.rolling_train_years,
+        test_years=args.rolling_test_years,
+        step_years=args.rolling_step_years,
+    )
+    if not splits:
+        raise RuntimeError("No rolling walk-forward folds fit the configured OOS years.")
+
+    train_frames: list[pd.DataFrame] = []
+    selected_frames: list[pd.DataFrame] = []
+    for split in splits:
+        print(
+            (
+                f"rolling fold {split.fold}: train {split.train_start_year}-"
+                f"{split.train_end_year}, reserve {split.test_start_year}-{split.test_end_year}"
+            ),
+            flush=True,
+        )
+        train_config = replace(
+            config,
+            oos_start_year=split.train_start_year,
+            oos_end_year=split.train_end_year,
+        )
+        train_metrics = run_screen(
+            train_config,
+            available_candidates,
+            policies,
+            rebalance_dates_by_period,
+            signal_cache,
+            returns_by_date=returns_by_date,
+            return_dates=return_dates,
+            benchmark_metrics_by_signal=benchmark_metrics_by_signal,
+            benchmark=benchmark,
+            risk_free=risk_free,
+            top_n_values=top_n_values,
+        )
+        train_metrics = sort_by_selection_score(train_metrics, args.selection_objective)
+        if train_metrics.empty:
+            continue
+        train_metrics = attach_split_columns(train_metrics, split, "train")
+        train_frames.append(train_metrics)
+
+        best = train_metrics.iloc[0]
+        best_candidate = next(
+            candidate for candidate in available_candidates if candidate.name == best["Candidate"]
+        )
+        best_policy = next(policy for policy in policies if policy.name == best["GatePolicy"])
+        period = str(best["RebalancePeriod"])
+        top_n = int(best["TopN"])
+        reserve_config = replace(
+            config,
+            oos_start_year=split.test_start_year,
+            oos_end_year=split.test_end_year,
+        )
+        reserve_metrics = run_screen(
+            reserve_config,
+            [best_candidate],
+            [best_policy],
+            {period: rebalance_dates_by_period[period]},
+            signal_cache,
+            returns_by_date=returns_by_date,
+            return_dates=return_dates,
+            benchmark_metrics_by_signal=benchmark_metrics_by_signal,
+            benchmark=benchmark,
+            risk_free=risk_free,
+            top_n_values=(top_n,),
+        )
+        reserve_metrics = sort_by_selection_score(reserve_metrics, args.selection_objective)
+        if reserve_metrics.empty:
+            continue
+        selected_train = train_metrics.head(1).copy()
+        selected_train.loc[:, "Phase"] = "selected_train"
+        selected_frames.append(selected_train)
+        selected_frames.append(attach_split_columns(reserve_metrics.head(1), split, "reserve"))
+
+    train_all = pd.concat(train_frames, ignore_index=True) if train_frames else pd.DataFrame()
+    selected = pd.concat(selected_frames, ignore_index=True) if selected_frames else pd.DataFrame()
+    train_all.to_csv(output_dir / "rolling_train_candidate_metrics.csv", index=False)
+    selected.to_csv(output_dir / "rolling_selected_folds.csv", index=False)
+    summary = rolling_strategy_summary(selected)
+    summary.to_csv(output_dir / "rolling_strategy_summary.csv", index=False)
+    write_candidate_catalog(available_candidates, output_dir)
+    write_rolling_report(output_dir, selected, summary, config, args.selection_objective)
+
+    if selected.empty:
+        raise RuntimeError("Rolling walk-forward produced no reserve metrics.")
+    display_columns = [
+        "Fold",
+        "Phase",
+        "Candidate",
+        "GatePolicy",
+        "RebalancePeriod",
+        "TopN",
+        "SelectionScore",
+        "CAGR",
+        "BenchmarkCAGR",
+        "SimpleAlphaAnnualized",
+        "MaxDrawdown",
+        "ExcessYearWinRate",
+    ]
+    print(selected[[column for column in display_columns if column in selected]].to_string(index=False))
+    print(f"wrote rolling walk-forward outputs to {output_dir}")
+    return 0
+
+
+def attach_split_columns(
+    metrics: pd.DataFrame,
+    split,
+    phase: str,
+) -> pd.DataFrame:
+    out = metrics.copy()
+    out.insert(0, "Phase", phase)
+    out.insert(0, "Fold", split.fold)
+    out.loc[:, "TrainStartYear"] = split.train_start_year
+    out.loc[:, "TrainEndYear"] = split.train_end_year
+    out.loc[:, "ReserveStartYear"] = split.test_start_year
+    out.loc[:, "ReserveEndYear"] = split.test_end_year
+    return out
+
+
+def rolling_strategy_summary(selected: pd.DataFrame) -> pd.DataFrame:
+    if selected.empty:
+        return pd.DataFrame()
+    reserve = selected.loc[selected["Phase"].eq("reserve")].copy()
+    if reserve.empty:
+        return pd.DataFrame()
+    key_columns = ["Candidate", "Family", "GatePolicy", "RebalancePeriod", "TopN"]
+    rows: list[dict[str, object]] = []
+    for keys, group in reserve.groupby(key_columns, dropna=False):
+        row = dict(zip(key_columns, keys, strict=True))
+        row.update(
+            {
+                "ReserveFolds": int(len(group)),
+                "MeanReserveSelectionScore": float(group["SelectionScore"].mean()),
+                "MedianReserveSelectionScore": float(group["SelectionScore"].median()),
+                "MeanReserveSimpleAlpha": float(group["SimpleAlphaAnnualized"].mean()),
+                "MedianReserveSimpleAlpha": float(group["SimpleAlphaAnnualized"].median()),
+                "WorstReserveSimpleAlpha": float(group["SimpleAlphaAnnualized"].min()),
+                "MeanReserveCAGR": float(group["CAGR"].mean()),
+                "MedianReserveCAGR": float(group["CAGR"].median()),
+                "WorstReserveDrawdown": float(group["MaxDrawdown"].min()),
+                "MeanReserveExcessYearWinRate": float(group["ExcessYearWinRate"].mean()),
+            }
+        )
+        rows.append(row)
+    return pd.DataFrame(rows).sort_values(
+        ["ReserveFolds", "MedianReserveSelectionScore", "MedianReserveSimpleAlpha"],
+        ascending=[False, False, False],
+    )
+
+
+def write_rolling_report(
+    output_dir: Path,
+    selected: pd.DataFrame,
+    summary: pd.DataFrame,
+    config: StrategyConfig,
+    selection_objective: str,
+) -> None:
+    lines = [
+        "# Rolling Walk-Forward Tuning",
+        "",
+        f"- Universe mode: `{config.universe_mode}`",
+        f"- Selection objective: `{selection_objective}`",
+        f"- OOS span: {config.oos_start_year}-{config.oos_end_year}",
+        "",
+        "## Selected Fold Results",
+        "",
+        markdown_table(
+            selected,
+            [
+                "Fold",
+                "Phase",
+                "Candidate",
+                "GatePolicy",
+                "RebalancePeriod",
+                "TopN",
+                "SelectionScore",
+                "CAGR",
+                "BenchmarkCAGR",
+                "SimpleAlphaAnnualized",
+                "MaxDrawdown",
+                "ExcessYearWinRate",
+            ],
+        ),
+        "",
+        "## Aggregate Reserve Summary",
+        "",
+        markdown_table(
+            summary,
+            [
+                "Candidate",
+                "GatePolicy",
+                "RebalancePeriod",
+                "TopN",
+                "ReserveFolds",
+                "MedianReserveSelectionScore",
+                "MedianReserveSimpleAlpha",
+                "WorstReserveSimpleAlpha",
+                "MedianReserveCAGR",
+                "WorstReserveDrawdown",
+            ],
+        ),
+        "",
+    ]
+    output_dir.joinpath("rolling_walk_forward_report.md").write_text(
+        "\n".join(lines),
+        encoding="utf-8",
+    )
+
+
+def markdown_table(frame: pd.DataFrame, columns: list[str]) -> str:
+    if frame is None or frame.empty:
+        return "_No rows._"
+    present = [column for column in columns if column in frame.columns]
+    if not present:
+        return "_No requested columns._"
+    out = frame[present].copy().astype(object)
+    percent_columns = {
+        column
+        for column in out.columns
+        if any(token in column for token in ("CAGR", "Alpha", "Drawdown", "Return", "WinRate"))
+    }
+    float_columns = {
+        "SelectionScore",
+        "MeanReserveSelectionScore",
+        "MedianReserveSelectionScore",
+        "Beta",
+        "Sharpe",
+        "InformationRatio",
+    }
+    for column in out.columns:
+        if column in percent_columns:
+            out.loc[:, column] = out[column].map(
+                lambda value: "" if pd.isna(value) else f"{float(value):.2%}"
+            )
+        elif column in float_columns:
+            out.loc[:, column] = out[column].map(
+                lambda value: "" if pd.isna(value) else f"{float(value):.4f}"
+            )
+        else:
+            out.loc[:, column] = out[column].map(lambda value: "" if pd.isna(value) else str(value))
+    header = "| " + " | ".join(out.columns) + " |"
+    separator = "| " + " | ".join(["---"] * len(out.columns)) + " |"
+    body = ["| " + " | ".join(row) + " |" for row in out.astype(str).to_numpy()]
+    return "\n".join([header, separator, *body])
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="In-sample tune PIT S&P 500 top-10 score parameters."
+        description="Tune PIT-safe score parameters on S&P 500 or broad WRDS universes."
     )
     parser.add_argument(
         "--config",
@@ -364,6 +671,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--random-candidates", type=int, default=1200)
     parser.add_argument("--seed", type=int, default=17)
     parser.add_argument("--show", type=int, default=12)
+    parser.add_argument(
+        "--selection-objective",
+        choices=OBJECTIVES,
+        default="robust_alpha",
+        help="Metric used to rank candidates. robust_alpha penalizes fragile alpha.",
+    )
     parser.add_argument("--oos-start-year", type=int, default=None)
     parser.add_argument("--oos-end-year", type=int, default=None)
     parser.add_argument("--end-date", default=None)
@@ -385,6 +698,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--top-count", type=int, default=200)
     parser.add_argument("--top-n", type=int, default=None)
+    parser.add_argument(
+        "--top-n-values",
+        default=None,
+        help="Comma-separated selected-name counts to test, e.g. 10,20,30,50.",
+    )
     parser.add_argument(
         "--min-history-months",
         type=int,
@@ -425,11 +743,52 @@ def parse_args() -> argparse.Namespace:
         help="Candidate input breadth. 'return' skips WRDS factor loading.",
     )
     parser.add_argument(
+        "--candidate-set",
+        choices=("all", "constrained"),
+        default="constrained",
+        help="Use constrained to prefer simple, low-degree candidate formulas.",
+    )
+    parser.add_argument(
         "--include-cluster-residuals",
         action="store_true",
         help="Include slower spectral cluster residual return features in the search.",
     )
+    parser.add_argument(
+        "--rolling-train-years",
+        type=int,
+        default=None,
+        help="Enable rolling walk-forward selection with this many training years per fold.",
+    )
+    parser.add_argument(
+        "--rolling-test-years",
+        type=int,
+        default=1,
+        help="Number of reserve years per rolling fold.",
+    )
+    parser.add_argument(
+        "--rolling-step-years",
+        type=int,
+        default=1,
+        help="Years to advance each rolling fold.",
+    )
     return parser.parse_args()
+
+
+def parse_top_n_values(raw: str | None, default_top_n: int) -> tuple[int, ...]:
+    if not raw:
+        return (int(default_top_n),)
+    values = tuple(
+        sorted(
+            {
+                int(value.strip())
+                for value in raw.split(",")
+                if value.strip()
+            }
+        )
+    )
+    if not values or any(value <= 0 for value in values):
+        raise ValueError("--top-n-values must contain positive integers")
+    return values
 
 
 def candidate_allowlist(metrics_path: Path, top_count: int) -> set[str]:
@@ -438,7 +797,7 @@ def candidate_allowlist(metrics_path: Path, top_count: int) -> set[str]:
         return set()
     sort_columns = [
         column
-        for column in ("SimpleAlphaAnnualized", "CAGR", "Sharpe")
+        for column in ("SelectionScore", "SimpleAlphaAnnualized", "CAGR", "Sharpe")
         if column in metrics
     ]
     if sort_columns:
@@ -466,11 +825,11 @@ def build_signal_cache(
     for index, signal_date in enumerate(signal_dates, start=1):
         if index == 1 or index % 10 == 0 or index == len(signal_dates):
             print(f"  signal {index}/{len(signal_dates)} {signal_date.date()}", flush=True)
-        snapshot = snapshot_as_of(sp500_source, signal_date)
-        mapped, _mapped_frame = map_snapshot_to_permnos(
-            snapshot,
-            identifier_history,
-            max_identifier_staleness_days=config.mapping.max_identifier_staleness_days,
+        mapped, mapped_frame = build_universe(
+            config,
+            signal_date=signal_date,
+            identifier_history=identifier_history,
+            sp500_source=sp500_source,
         )
         if mapped.mapped_permno_count < config.top_n:
             continue
@@ -514,10 +873,17 @@ def build_signal_cache(
             clusters,
             residual_columns=residual_columns,
         ).join(factor_scores, how="left")
+        group_labels = build_group_labels(
+            inputs.index,
+            config.sector_control,
+            mapped_frame=mapped_frame,
+            score_inputs=inputs,
+        )
         cache[signal_date] = SignalSlice(
             signal_date=signal_date,
             source_snapshot_date=mapped.source_snapshot_date,
             scores=zscore_columns(inputs),
+            group_labels=group_labels,
             median_worst_60m=metric_median(inputs, "ret_horizon_worst_60m"),
             raw_universe_count=mapped.source_symbol_count,
             mapped_universe_count=mapped.mapped_permno_count,
@@ -532,6 +898,7 @@ def build_candidates(
     seed: int,
     include_cluster_residuals: bool,
     feature_set: str,
+    candidate_set: str = "constrained",
 ) -> list[Candidate]:
     candidates: list[Candidate] = []
     if feature_set != "return":
@@ -561,12 +928,18 @@ def build_candidates(
 
     rng = random.Random(seed)
     signed_pool = [(column, sign) for column in columns for sign in (-1.0, 1.0)]
+    size_choices = (2, 3) if candidate_set == "constrained" else (2, 3, 4, 5, 6)
+    magnitude_choices = (
+        (0.5, 1.0, 2.0)
+        if candidate_set == "constrained"
+        else (0.5, 1.0, 1.5, 2.0, 3.0, 5.0, 8.0)
+    )
     for index in range(random_candidates):
-        size = rng.choice((2, 3, 4, 5, 6))
+        size = rng.choice(size_choices)
         picks = rng.sample(signed_pool, size)
         weights: dict[str, float] = {}
         for column, sign in picks:
-            magnitude = rng.choice((0.5, 1.0, 1.5, 2.0, 3.0, 5.0, 8.0))
+            magnitude = rng.choice(magnitude_choices)
             weights[column] = weights.get(column, 0.0) + sign * magnitude
         weights = {column: weight for column, weight in weights.items() if weight != 0.0}
         if weights:
@@ -889,46 +1262,52 @@ def run_screen(
     benchmark_metrics_by_signal: dict[pd.Timestamp, dict[str, float]],
     benchmark: pd.DataFrame,
     risk_free: pd.DataFrame | None,
+    top_n_values: tuple[int, ...],
 ) -> pd.DataFrame:
     rows: list[pd.DataFrame] = []
     for index, candidate in enumerate(candidates, start=1):
         if index == 1 or index % 100 == 0 or index == len(candidates):
             print(f"  candidate {index}/{len(candidates)} {candidate.name}", flush=True)
-        for period, rebalance_dates in rebalance_dates_by_period.items():
-            raw = build_raw_returns_for_candidate(
-                config,
-                candidate,
-                period,
-                rebalance_dates,
-                signal_cache,
-                returns_by_date=returns_by_date,
-                return_dates=return_dates,
-                benchmark_metrics_by_signal=benchmark_metrics_by_signal,
-            )
-            if raw.empty:
-                continue
-            for policy in policies:
-                gated = apply_policy(
-                    raw,
-                    policy,
-                    oos_start_year=config.oos_start_year,
-                    oos_end_year=config.oos_end_year,
+        for top_n in top_n_values:
+            for period, rebalance_dates in rebalance_dates_by_period.items():
+                raw = build_raw_returns_for_candidate(
+                    config,
+                    candidate,
+                    period,
+                    rebalance_dates,
+                    signal_cache,
+                    returns_by_date=returns_by_date,
+                    return_dates=return_dates,
+                    benchmark_metrics_by_signal=benchmark_metrics_by_signal,
+                    top_n=top_n,
                 )
-                if gated.empty:
+                if raw.empty:
                     continue
-                attached = attach_optional_series(gated, benchmark, risk_free)
-                perf = performance_summary(
-                    attached,
-                    rebalance_period=period,
-                    frequency=period_frequency(period),
-                    benchmark_name="SPY",
-                )
-                if perf.empty:
-                    continue
-                perf.insert(0, "GatePolicy", policy.name)
-                perf.insert(0, "Family", candidate.family)
-                perf.insert(0, "Candidate", candidate.name)
-                rows.append(perf)
+                for policy in policies:
+                    gated = apply_policy(
+                        raw,
+                        policy,
+                        oos_start_year=config.oos_start_year,
+                        oos_end_year=config.oos_end_year,
+                    )
+                    if gated.empty:
+                        continue
+                    attached = attach_optional_series(gated, benchmark, risk_free)
+                    perf = performance_summary(
+                        attached,
+                        rebalance_period=period,
+                        frequency=period_frequency(period),
+                        benchmark_name="SPY",
+                    )
+                    if perf.empty:
+                        continue
+                    for key, value in yearly_excess_diagnostics(attached).items():
+                        perf.loc[:, key] = value
+                    perf.insert(0, "TopN", top_n)
+                    perf.insert(0, "GatePolicy", policy.name)
+                    perf.insert(0, "Family", candidate.family)
+                    perf.insert(0, "Candidate", candidate.name)
+                    rows.append(perf)
     return pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
 
 
@@ -942,13 +1321,20 @@ def build_raw_returns_for_candidate(
     returns_by_date: dict[pd.Timestamp, pd.Series],
     return_dates: pd.Index,
     benchmark_metrics_by_signal: dict[pd.Timestamp, dict[str, float]],
+    top_n: int,
 ) -> pd.DataFrame:
     rows: list[dict[str, object]] = []
     for index, signal_date in enumerate(rebalance_dates):
         signal = signal_cache.get(signal_date)
         if signal is None:
             continue
-        selected = score_candidate(signal.scores, candidate.weights, config.top_n)
+        selected = score_candidate(
+            signal.scores,
+            candidate.weights,
+            top_n,
+            config,
+            group_labels=signal.group_labels,
+        )
         if selected.empty:
             continue
         weights = portfolio_weights(
@@ -986,7 +1372,8 @@ def build_raw_returns_for_candidate(
                     "RawPortfolioReturn": float(
                         selected_returns.mul(aligned_weights).sum()
                     ),
-                    "RawActiveNames": config.top_n,
+                    "RawActiveNames": top_n,
+                    "TopN": top_n,
                     "RawUniverseCount": signal.raw_universe_count,
                     "MappedUniverseCount": signal.mapped_universe_count,
                     "FeatureEligibleCount": signal.feature_eligible_count,
@@ -1001,14 +1388,63 @@ def build_raw_returns_for_candidate(
     return pd.DataFrame(rows)
 
 
-def score_candidate(scores: pd.DataFrame, weights: dict[str, float], top_n: int) -> pd.Series:
+def yearly_excess_diagnostics(attached: pd.DataFrame) -> dict[str, float]:
+    if attached.empty or "BenchmarkReturn" not in attached.columns:
+        return {
+            "ExcessYears": 0,
+            "PositiveExcessYears": 0,
+            "ExcessYearWinRate": np.nan,
+            "MedianExcessYear": np.nan,
+            "WorstExcessYear": np.nan,
+        }
+    frame = attached.copy()
+    frame.loc[:, "Year"] = pd.to_datetime(frame["Date"]).dt.year
+    excess_returns: list[float] = []
+    for _year, group in frame.groupby("Year"):
+        strategy_return = compound(group["PortfolioReturn"])
+        benchmark_return = compound(group["BenchmarkReturn"])
+        if pd.isna(strategy_return) or pd.isna(benchmark_return):
+            continue
+        excess_returns.append(float(strategy_return - benchmark_return))
+    if not excess_returns:
+        return {
+            "ExcessYears": 0,
+            "PositiveExcessYears": 0,
+            "ExcessYearWinRate": np.nan,
+            "MedianExcessYear": np.nan,
+            "WorstExcessYear": np.nan,
+        }
+    values = pd.Series(excess_returns, dtype=float)
+    positive = int(values.gt(0.0).sum())
+    return {
+        "ExcessYears": int(len(values)),
+        "PositiveExcessYears": positive,
+        "ExcessYearWinRate": float(positive / len(values)),
+        "MedianExcessYear": float(values.median()),
+        "WorstExcessYear": float(values.min()),
+    }
+
+
+def score_candidate(
+    scores: pd.DataFrame,
+    weights: dict[str, float],
+    top_n: int,
+    config: StrategyConfig,
+    *,
+    group_labels: pd.Series | None,
+) -> pd.Series:
     missing = [column for column in weights if column not in scores.columns]
     if missing:
         return pd.Series(dtype=float)
     composite = pd.Series(0.0, index=scores.index, name="Score")
     for column, weight in weights.items():
         composite = composite.add(scores[column].astype(float) * float(weight), fill_value=0.0)
-    selected = composite.dropna().sort_values(ascending=False).head(top_n)
+    selected = select_scores(
+        composite,
+        top_n,
+        config.sector_control,
+        group_labels=group_labels,
+    )
     return selected if len(selected) == top_n else pd.Series(dtype=float)
 
 
@@ -1063,23 +1499,29 @@ def write_tuned_config(
     candidate: Candidate,
     policy: GatePolicy,
     period: str,
+    top_n: int,
     output_dir: Path,
 ) -> Path:
     raw = yaml.safe_load((ROOT / "configs" / "local.example.yaml").read_text(encoding="utf-8"))
+    raw["universe_mode"] = config.universe_mode
     raw["start_year"] = config.start_year
     raw["oos_start_year"] = config.oos_start_year
     raw["oos_end_year"] = config.oos_end_year
     raw["end_date"] = config.end_date
     raw["rebalance_periods"] = [period]
-    raw["top_n"] = config.top_n
+    raw["top_n"] = top_n
     raw["min_history_months"] = config.min_history_months
     raw["include_signal_month_return"] = config.include_signal_month_return
     raw["require_current_return"] = config.require_current_return
     raw["missing_returns_as_cash"] = config.missing_returns_as_cash
     raw["portfolio_weighting"] = config.portfolio_weighting
     raw["rank_decay"] = config.rank_decay
+    raw["sector_control"] = sector_control_yaml_payload(config)
     raw["score_weights"] = candidate.weights
-    raw["output_dir"] = "../outputs/tuned_sp500_top10_alpha_gt15"
+    raw["output_dir"] = (
+        f"../outputs/tuned_{config.universe_mode}_top{top_n}_"
+        f"{period.lower()}_{slugify(candidate.name)}"
+    )
     if policy.gate is None:
         raw["gate"] = {
             "enabled": False,
@@ -1102,6 +1544,15 @@ def gate_yaml_payload(gate: GateConfig) -> dict[str, object]:
     return payload
 
 
+def sector_control_yaml_payload(config: StrategyConfig) -> dict[str, object]:
+    return dict(config.sector_control.__dict__)
+
+
+def slugify(value: object) -> str:
+    text = str(value).lower()
+    return "".join(char if char.isalnum() else "_" for char in text).strip("_")
+
+
 def write_report(
     output_dir: Path,
     metrics: pd.DataFrame,
@@ -1109,6 +1560,8 @@ def write_report(
     policy: GatePolicy,
     tuned_config: Path,
     config: StrategyConfig,
+    *,
+    selection_objective: str,
 ) -> None:
     best = metrics.iloc[0]
     start_date = pd.to_datetime(best["StartDate"]).date()
@@ -1121,7 +1574,8 @@ def write_report(
             f"{config.oos_start_year}-{config.oos_end_year} OOS window "
             f"({start_date} through {end_date})."
         ),
-        "Treat the winning specification as tuned research output until it survives a separate reserve or live validation window.",
+        f"Selection objective: `{selection_objective}` with score {float(best['SelectionScore']):.4f}.",
+        "Treat the winning specification as tuned research output until it survives rolling folds, a separate reserve, or live validation.",
         "",
         "## Best Candidate",
         "",
@@ -1129,6 +1583,8 @@ def write_report(
         f"- Family: `{candidate.family}`",
         f"- Gate policy: `{policy.name}`",
         f"- Rebalance period: `{best['RebalancePeriod']}`",
+        f"- Top N: {int(best['TopN'])}",
+        f"- Universe mode: `{config.universe_mode}`",
         f"- CAGR: {float(best['CAGR']):.2%}",
         f"- SPY CAGR: {float(best['BenchmarkCAGR']):.2%}",
         f"- Simple alpha: {float(best['SimpleAlphaAnnualized']):.2%}",
@@ -1137,6 +1593,8 @@ def write_report(
         f"- Beta: {float(best['Beta']):.2f}",
         f"- Max drawdown: {float(best['MaxDrawdown']):.2%}",
         f"- Active share: {float(best['ActiveShare']):.2%}",
+        f"- Excess year win rate: {float(best.get('ExcessYearWinRate', np.nan)):.2%}",
+        f"- Worst excess year: {float(best.get('WorstExcessYear', np.nan)):.2%}",
         "",
         "## Score Weights",
         "",

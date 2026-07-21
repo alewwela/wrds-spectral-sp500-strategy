@@ -36,6 +36,7 @@ from wrds_spectral_sp500_strategy.rebalance import (
     period_frequency,
     select_rebalance_dates,
 )
+from wrds_spectral_sp500_strategy.selection import build_group_labels, select_scores
 from wrds_spectral_sp500_strategy.sp500 import (
     load_configured_source,
     map_snapshot_to_permnos,
@@ -43,6 +44,7 @@ from wrds_spectral_sp500_strategy.sp500 import (
     snapshot_as_of,
     source_metadata,
 )
+from wrds_spectral_sp500_strategy.universe import broad_wrds_universe_as_of
 
 
 BROAD_UNIVERSE_RESULTS = {
@@ -97,6 +99,7 @@ class SignalResult:
     status: str
     audit: dict[str, object]
     holdings: pd.DataFrame
+    group_labels: pd.Series | None = None
 
     @property
     def valid(self) -> bool:
@@ -123,9 +126,16 @@ def run_backtests(config: StrategyConfig) -> BacktestOutputs:
         for column in config.score_weights
         if not column.startswith("ret_") and not column.startswith("cluster_")
     ]
+    for column in sector_factor_columns(config):
+        if column not in factor_columns:
+            factor_columns.append(column)
     factors = load_factor_frames(config.factor_paths, factor_columns)
     identifier_history = load_identifier_history(config.pit_universe_repo)
-    sp500_source = load_configured_source(config.sp500_source)
+    sp500_source = (
+        load_configured_source(config.sp500_source)
+        if config.universe_mode == "sp500"
+        else pd.DataFrame()
+    )
 
     all_dates = pd.Series(returns["Date"].dropna().unique())
     all_dates = pd.to_datetime(all_dates).sort_values()
@@ -216,14 +226,14 @@ def run_backtests(config: StrategyConfig) -> BacktestOutputs:
 
     summary = pd.concat(summary_frames, ignore_index=True) if summary_frames else pd.DataFrame()
     yearly = pd.concat(yearly_frames, ignore_index=True) if yearly_frames else pd.DataFrame()
-    comparison = compare_with_broad_universe(summary)
+    comparison = compare_with_broad_universe(summary, universe_mode=config.universe_mode)
     summary.to_csv(output_dir / "summary.csv", index=False)
     yearly.to_csv(output_dir / "yearly_returns.csv", index=False)
     comparison.to_csv(output_dir / "comparison_against_broad_universe.csv", index=False)
     write_run_summary(
         config,
         output_dir,
-        source_info=source_metadata(config.sp500_source, sp500_source),
+        source_info=universe_metadata(config, sp500_source, identifier_history),
         rebalance_dates_by_period=rebalance_dates_by_period,
         signal_audit=audit,
     )
@@ -245,11 +255,11 @@ def build_signal(
     identifier_history: pd.DataFrame,
     sp500_source: pd.DataFrame,
 ) -> SignalResult:
-    snapshot = snapshot_as_of(sp500_source, signal_date)
-    mapped, mapped_frame = map_snapshot_to_permnos(
-        snapshot,
-        identifier_history,
-        max_identifier_staleness_days=config.mapping.max_identifier_staleness_days,
+    mapped, mapped_frame = build_universe(
+        config,
+        signal_date=signal_date,
+        identifier_history=identifier_history,
+        sp500_source=sp500_source,
     )
     base_audit = mapped_universe_audit_row(mapped)
     base_audit.update(
@@ -263,6 +273,9 @@ def build_signal(
             "MaxFactorDateUsed": pd.NaT,
             "MaxDataAvailableDateUsed": pd.NaT,
             "FutureAvailableRowsExcluded": 0,
+            "SectorControlEnabled": config.sector_control.enabled,
+            "SectorControlGroupCount": 0,
+            "SelectedGroupCount": 0,
         }
     )
     if mapped.mapped_permno_count < config.top_n:
@@ -317,7 +330,18 @@ def build_signal(
     except ValueError as exc:
         base_audit.update({"FeatureEligibleCount": int(len(score_inputs)), "StatusDetail": str(exc)})
         return empty_signal(signal_date, mapped.source_snapshot_date, mapped, base_audit, "missing_score_inputs")
-    selected = scores.dropna().sort_values(ascending=False).head(config.top_n)
+    group_labels = build_group_labels(
+        score_inputs.index,
+        config.sector_control,
+        mapped_frame=mapped_frame,
+        score_inputs=score_inputs,
+    )
+    selected = select_scores(
+        scores,
+        config.top_n,
+        config.sector_control,
+        group_labels=group_labels,
+    )
     if len(selected) < config.top_n:
         base_audit.update({"FeatureEligibleCount": int(len(score_inputs))})
         return empty_signal(signal_date, mapped.source_snapshot_date, mapped, base_audit, "insufficient_scores")
@@ -338,17 +362,19 @@ def build_signal(
     )
     holdings.loc[:, "Weight"] = holdings["PERMNO"].map(weights)
     if not mapped_frame.empty:
+        mapped_columns = [
+            "SourceSymbol",
+            "PERMNO",
+            "MatchedFeedSymbol",
+            "MatchedYFTicker",
+            "MatchedSecurity",
+            "IdentifierDate",
+        ]
+        mapped_columns.extend(
+            column for column in ("MarketCap", "Exchange", "SIC") if column in mapped_frame.columns
+        )
         holdings = holdings.merge(
-            mapped_frame[
-                [
-                    "SourceSymbol",
-                    "PERMNO",
-                    "MatchedFeedSymbol",
-                    "MatchedYFTicker",
-                    "MatchedSecurity",
-                    "IdentifierDate",
-                ]
-            ],
+            mapped_frame[mapped_columns],
             on="PERMNO",
             how="left",
         )
@@ -359,6 +385,12 @@ def build_signal(
             "SelectedCount": int(len(selected)),
             "TopScore": float(selected.max()),
             "MedianWorst60M": median_worst,
+            "SectorControlGroupCount": int(group_labels.nunique()) if group_labels is not None else 0,
+            "SelectedGroupCount": (
+                int(group_labels.reindex(selected.index).nunique())
+                if group_labels is not None
+                else 0
+            ),
             **availability,
         }
     )
@@ -373,6 +405,28 @@ def build_signal(
         status="ok",
         audit=base_audit,
         holdings=holdings,
+        group_labels=group_labels,
+    )
+
+
+def build_universe(
+    config: StrategyConfig,
+    *,
+    signal_date: pd.Timestamp,
+    identifier_history: pd.DataFrame,
+    sp500_source: pd.DataFrame,
+):
+    if config.universe_mode == "broad_wrds":
+        return broad_wrds_universe_as_of(
+            identifier_history,
+            signal_date,
+            max_identifier_staleness_days=config.mapping.max_identifier_staleness_days,
+        )
+    snapshot = snapshot_as_of(sp500_source, signal_date)
+    return map_snapshot_to_permnos(
+        snapshot,
+        identifier_history,
+        max_identifier_staleness_days=config.mapping.max_identifier_staleness_days,
     )
 
 
@@ -505,9 +559,25 @@ def cluster_residual_source_columns(weights: dict[str, float]) -> tuple[str, ...
     return tuple(dict.fromkeys(columns))
 
 
-def compare_with_broad_universe(summary: pd.DataFrame) -> pd.DataFrame:
+def sector_factor_columns(config: StrategyConfig) -> tuple[str, ...]:
+    control = config.sector_control
+    if not control.enabled:
+        return ()
+    columns: list[str] = []
+    if control.bucket_column and not control.bucket_column.startswith(("ret_", "cluster_")):
+        columns.append(control.bucket_column)
+    identifier_columns = {"SIC", "MarketCap", "Exchange"}
+    if (
+        control.column not in identifier_columns
+        and not control.column.startswith(("ret_", "cluster_"))
+    ):
+        columns.append(control.column)
+    return tuple(dict.fromkeys(columns))
+
+
+def compare_with_broad_universe(summary: pd.DataFrame, *, universe_mode: str = "sp500") -> pd.DataFrame:
     rows: list[dict[str, object]] = []
-    if summary.empty:
+    if summary.empty or universe_mode != "sp500":
         return pd.DataFrame()
     metrics = [
         "CAGR",
@@ -539,6 +609,28 @@ def compare_with_broad_universe(summary: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def universe_metadata(
+    config: StrategyConfig,
+    sp500_source: pd.DataFrame,
+    identifier_history: pd.DataFrame,
+) -> dict[str, object]:
+    if config.universe_mode == "sp500":
+        return source_metadata(config.sp500_source, sp500_source)
+    return {
+        "source_repo": str(config.pit_universe_repo),
+        "source_schema": "WRDS CRSP CIZ monthly identifier rows",
+        "source_license": "private WRDS export",
+        "source_terms_caveat": "Local/private WRDS data; not committed to this repo.",
+        "source_rows": int(len(identifier_history)),
+        "source_min_date": identifier_history["Date"].min().strftime("%Y-%m-%d")
+        if not identifier_history.empty
+        else None,
+        "source_max_date": identifier_history["Date"].max().strftime("%Y-%m-%d")
+        if not identifier_history.empty
+        else None,
+    }
+
+
 def write_run_summary(
     config: StrategyConfig,
     output_dir: Path,
@@ -548,13 +640,15 @@ def write_run_summary(
     signal_audit: pd.DataFrame,
 ) -> None:
     payload = {
-        "method": "pit_sp500_score_backtest",
+        "method": f"pit_{config.universe_mode}_score_backtest",
+        "universe_mode": config.universe_mode,
         "top_n": config.top_n,
         "portfolio": "long-only, unlevered, no shorts, no leverage",
         "weighting": weighting_description(config),
         "score_weights": config.score_weights,
         "portfolio_weighting": config.portfolio_weighting,
         "rank_decay": config.rank_decay,
+        "sector_control": dict(config.sector_control.__dict__),
         "gate": gate_payload(config.gate),
         "start_year": config.start_year,
         "oos_start_year": config.oos_start_year,
@@ -572,7 +666,9 @@ def write_run_summary(
         "identifier_bridge": {
             "source": "WRDS CRSP CIZ monthly return panel audit identifiers",
             "max_identifier_staleness_days": config.mapping.max_identifier_staleness_days,
-            "native_permon_keyed_sp500_artifact_present_in_pit_repo": False,
+            "native_permon_keyed_sp500_artifact_present_in_pit_repo": False
+            if config.universe_mode == "sp500"
+            else None,
         },
         "signal_status_counts": signal_audit["Status"].value_counts().to_dict()
         if "Status" in signal_audit
@@ -593,17 +689,18 @@ def write_report(
     audit: pd.DataFrame,
 ) -> None:
     lines = [
-        "# PIT S&P 500 Strategy Backtest",
+        "# PIT Strategy Backtest",
         "",
         "## Setup",
         "",
-        "- Universe: pinned `fja05680/sp500` PIT constituent snapshots, mapped to WRDS PERMNOs using CRSP CIZ historical audit tickers as of each signal date.",
+        f"- Universe: {universe_description(config)}",
         f"- Portfolio: long-only, unlevered top {config.top_n}.",
         f"- Weighting: {weighting_description(config)}",
+        f"- Sector/group control: {sector_control_description(config)}",
         f"- Rebalance periods: {', '.join(config.rebalance_periods)}.",
         f"- Score weights: `{json.dumps(config.score_weights, sort_keys=True)}`, with each input cross-sectionally z-scored.",
         f"- Gate: {gate_description(config.gate)}",
-        "- OOS window: 2001-2025, when data supports the signal and forward-return window.",
+        f"- OOS window: {config.oos_start_year}-{config.oos_end_year}, when data supports the signal and forward-return window.",
         "",
         "## Summary",
         "",
@@ -626,23 +723,7 @@ def write_report(
         "",
         "## Broad Universe Comparison",
         "",
-        markdown_table(
-            comparison,
-            [
-                "RebalancePeriod",
-                "SP500_CAGR",
-                "BroadWRDS_CAGR",
-                "Difference_CAGR",
-                "SP500_SimpleAlphaAnnualized",
-                "BroadWRDS_SimpleAlphaAnnualized",
-                "Difference_SimpleAlphaAnnualized",
-                "SP500_CAPMAlphaAnnualized",
-                "BroadWRDS_CAPMAlphaAnnualized",
-                "Difference_CAPMAlphaAnnualized",
-                "SP500_MaxDrawdown",
-                "BroadWRDS_MaxDrawdown",
-            ],
-        ),
+        broad_comparison_text(config, comparison),
         "",
         "## Screener / Forward Test",
         "",
@@ -652,7 +733,7 @@ def write_report(
         "",
         "## Look-Ahead Assessment",
         "",
-        "- S&P 500 membership never uses a source row after the signal date.",
+        f"- {universe_pit_safety_text(config)}",
         "- The ticker-to-PERMNO bridge uses CRSP identifier rows observed on or before the signal date, with a bounded staleness window.",
         "- Factor data is selected with both `Date <= signal date` and `DataAvailableDate <= signal date` when availability is present.",
         "- Trailing return features use returns before the signal date because `include_signal_month_return` is false.",
@@ -660,7 +741,7 @@ def write_report(
         "",
         "## Native Artifact Gap",
         "",
-        "The WRDS PIT database repo did not contain a native PERMNO-keyed PIT S&P 500 membership artifact. This run uses the pinned constituent source plus a PIT identifier bridge; `docs/wrds_pit_sp500_artifact_request.md` describes the requested database artifact.",
+        native_artifact_gap_text(config),
         "",
         "## Output Files",
         "",
@@ -753,6 +834,80 @@ def gate_description(gate) -> str:
         f"median `ret_horizon_worst_60m` is {gate.median_worst_operator} the "
         f"prior-year expanding {gate.median_worst_quantile:.0%} percentile."
     )
+
+
+def universe_description(config: StrategyConfig) -> str:
+    if config.universe_mode == "broad_wrds":
+        return (
+            "broad WRDS CRSP CIZ PERMNO universe from current PIT identifier rows as "
+            "of each signal date."
+        )
+    return (
+        "pinned `fja05680/sp500` PIT constituent snapshots, mapped to WRDS PERMNOs "
+        "using CRSP CIZ historical audit tickers as of each signal date."
+    )
+
+
+def universe_pit_safety_text(config: StrategyConfig) -> str:
+    if config.universe_mode == "broad_wrds":
+        return "Broad WRDS membership uses only identifier rows dated on or before the signal date."
+    return "S&P 500 membership never uses a source row after the signal date."
+
+
+def native_artifact_gap_text(config: StrategyConfig) -> str:
+    if config.universe_mode == "broad_wrds":
+        return (
+            "This broad-universe run uses the native WRDS CRSP CIZ identifier/return "
+            "panel directly, so it does not require a public S&P ticker source."
+        )
+    return (
+        "The WRDS PIT database repo did not contain a native PERMNO-keyed PIT S&P "
+        "500 membership artifact. This run uses the pinned constituent source plus "
+        "a PIT identifier bridge; `docs/wrds_pit_sp500_artifact_request.md` "
+        "describes the requested database artifact."
+    )
+
+
+def broad_comparison_text(config: StrategyConfig, comparison: pd.DataFrame) -> str:
+    if config.universe_mode != "sp500":
+        return "_Skipped because this run already uses the broad WRDS universe._"
+    return markdown_table(
+        comparison,
+        [
+            "RebalancePeriod",
+            "SP500_CAGR",
+            "BroadWRDS_CAGR",
+            "Difference_CAGR",
+            "SP500_SimpleAlphaAnnualized",
+            "BroadWRDS_SimpleAlphaAnnualized",
+            "Difference_SimpleAlphaAnnualized",
+            "SP500_CAPMAlphaAnnualized",
+            "BroadWRDS_CAPMAlphaAnnualized",
+            "Difference_CAPMAlphaAnnualized",
+            "SP500_MaxDrawdown",
+            "BroadWRDS_MaxDrawdown",
+        ],
+    )
+
+
+def sector_control_description(config: StrategyConfig) -> str:
+    control = config.sector_control
+    if not control.enabled:
+        return "disabled."
+    parts = []
+    if control.bucket_column:
+        parts.append(f"bucket `{control.bucket_column}` into {control.bucket_count} groups")
+    else:
+        parts.append(f"group by `{control.column}`")
+        if control.column.upper() == "SIC":
+            parts.append(f"using first {control.sic_digits} SIC digit(s)")
+    if control.max_per_group is not None:
+        parts.append(f"max {control.max_per_group} selected names per group")
+    if control.min_groups:
+        parts.append(f"require at least {control.min_groups} groups")
+    if control.neutralize_scores:
+        parts.append("rank group-neutralized scores")
+    return "; ".join(parts) + "."
 
 
 def weighting_description(config: StrategyConfig) -> str:

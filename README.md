@@ -9,14 +9,17 @@ the code points at existing local exports.
 ## Strategy
 
 - Long-only and unlevered.
-- Top 10 stocks.
+- Top 10 stocks by default; tuning can evaluate broader top-N sleeves.
 - Default weighting is equal-weight; configs can opt into rank-decay weighting
   while still holding all 10 selected names.
 - Rebalance periods: 3M, 6M, 1Y.
 - Benchmark: SPY monthly adjusted returns.
-- Universe: PIT S&P 500 membership from pinned `fja05680/sp500` snapshots.
+- Universe: PIT S&P 500 membership from pinned `fja05680/sp500` snapshots by
+  default, or `universe_mode: broad_wrds` for the broader WRDS CRSP CIZ panel.
 - Identifier bridge: WRDS CRSP CIZ historical tickers mapped to PERMNO as of
   each signal date.
+- Optional sector/group controls can cap selected names by leading SIC group,
+  neutralize scores within groups, or use PIT numeric-factor quantile buckets.
 
 Fixed score, descending after cross-sectional z-scoring:
 
@@ -51,6 +54,21 @@ Outputs are written under `outputs/current_fixed_top10_sp500/`.
 
 `scripts/tune_sp500_parameters.py` searches PIT-safe score parameters and writes
 diagnostics under `outputs/tuned_sp500_alpha_search/`.
+
+The tuner now supports the seven alpha-improvement recommendations:
+
+- `universe_mode: broad_wrds` to leave the S&P 500-only universe.
+- `--selection-objective robust_alpha` to avoid selecting on max alpha alone.
+- `--rolling-train-years` / `--rolling-test-years` for rolling walk-forward
+  selection and reserve evaluation.
+- `--candidate-set constrained` for simpler low-degree formulas.
+- `--top-n-values 10,20,30,50` to relax the fixed top-10 sleeve.
+- `sector_control` YAML settings for SIC or proxy-bucket controls.
+- `SelectionScore`, excess-year diagnostics, and rolling summaries in outputs.
+
+See `docs/alpha_improvement_recommendations.md` and
+`configs/seven_recommendations_search.example.yaml` for a concrete starting
+point.
 
 The checked-in tuned example is `configs/tuned_alpha_gt15.example.yaml`. The
 latest rerun selected parameters on 2001-2020 only, reserving 2021-2025 for a
