@@ -415,76 +415,83 @@ def run_rolling_mode(
     if not splits:
         raise RuntimeError("No rolling walk-forward folds fit the configured OOS years.")
 
+    print(
+        f"rolling cached evaluation: {len(splits)} folds, "
+        f"{len(available_candidates)} candidates",
+        flush=True,
+    )
     train_frames: list[pd.DataFrame] = []
-    selected_frames: list[pd.DataFrame] = []
-    for split in splits:
-        print(
-            (
-                f"rolling fold {split.fold}: train {split.train_start_year}-"
-                f"{split.train_end_year}, reserve {split.test_start_year}-{split.test_end_year}"
-            ),
-            flush=True,
-        )
-        train_config = replace(
-            config,
-            oos_start_year=split.train_start_year,
-            oos_end_year=split.train_end_year,
-        )
-        train_metrics = run_screen(
-            train_config,
-            available_candidates,
-            policies,
-            rebalance_dates_by_period,
-            signal_cache,
-            returns_by_date=returns_by_date,
-            return_dates=return_dates,
-            benchmark_metrics_by_signal=benchmark_metrics_by_signal,
-            benchmark=benchmark,
-            risk_free=risk_free,
-            top_n_values=top_n_values,
-        )
-        train_metrics = sort_by_selection_score(train_metrics, args.selection_objective)
-        if train_metrics.empty:
-            continue
-        train_metrics = attach_split_columns(train_metrics, split, "train")
-        train_frames.append(train_metrics)
-
-        best = train_metrics.iloc[0]
-        best_candidate = next(
-            candidate for candidate in available_candidates if candidate.name == best["Candidate"]
-        )
-        best_policy = next(policy for policy in policies if policy.name == best["GatePolicy"])
-        period = str(best["RebalancePeriod"])
-        top_n = int(best["TopN"])
-        reserve_config = replace(
-            config,
-            oos_start_year=split.test_start_year,
-            oos_end_year=split.test_end_year,
-        )
-        reserve_metrics = run_screen(
-            reserve_config,
-            [best_candidate],
-            [best_policy],
-            {period: rebalance_dates_by_period[period]},
-            signal_cache,
-            returns_by_date=returns_by_date,
-            return_dates=return_dates,
-            benchmark_metrics_by_signal=benchmark_metrics_by_signal,
-            benchmark=benchmark,
-            risk_free=risk_free,
-            top_n_values=(top_n,),
-        )
-        reserve_metrics = sort_by_selection_score(reserve_metrics, args.selection_objective)
-        if reserve_metrics.empty:
-            continue
-        selected_train = train_metrics.head(1).copy()
-        selected_train.loc[:, "Phase"] = "selected_train"
-        selected_frames.append(selected_train)
-        selected_frames.append(attach_split_columns(reserve_metrics.head(1), split, "reserve"))
+    reserve_frames: list[pd.DataFrame] = []
+    for index, candidate in enumerate(available_candidates, start=1):
+        if index == 1 or index % 100 == 0 or index == len(available_candidates):
+            print(f"  candidate {index}/{len(available_candidates)} {candidate.name}", flush=True)
+        for top_n in top_n_values:
+            for period, rebalance_dates in rebalance_dates_by_period.items():
+                raw = build_raw_returns_for_candidate(
+                    config,
+                    candidate,
+                    period,
+                    rebalance_dates,
+                    signal_cache,
+                    returns_by_date=returns_by_date,
+                    return_dates=return_dates,
+                    benchmark_metrics_by_signal=benchmark_metrics_by_signal,
+                    top_n=top_n,
+                )
+                if raw.empty:
+                    continue
+                for policy in policies:
+                    for split in splits:
+                        train_metrics = evaluate_policy_window(
+                            raw,
+                            policy,
+                            period=period,
+                            config=config,
+                            start_year=split.train_start_year,
+                            end_year=split.train_end_year,
+                            benchmark=benchmark,
+                            risk_free=risk_free,
+                        )
+                        if not train_metrics.empty:
+                            train_frames.append(
+                                add_candidate_split_columns(
+                                    train_metrics,
+                                    candidate,
+                                    policy,
+                                    top_n=top_n,
+                                    split=split,
+                                    phase="train",
+                                )
+                            )
+                        reserve_metrics = evaluate_policy_window(
+                            raw,
+                            policy,
+                            period=period,
+                            config=config,
+                            start_year=split.test_start_year,
+                            end_year=split.test_end_year,
+                            benchmark=benchmark,
+                            risk_free=risk_free,
+                        )
+                        if not reserve_metrics.empty:
+                            reserve_frames.append(
+                                add_candidate_split_columns(
+                                    reserve_metrics,
+                                    candidate,
+                                    policy,
+                                    top_n=top_n,
+                                    split=split,
+                                    phase="reserve",
+                                )
+                            )
 
     train_all = pd.concat(train_frames, ignore_index=True) if train_frames else pd.DataFrame()
-    selected = pd.concat(selected_frames, ignore_index=True) if selected_frames else pd.DataFrame()
+    reserve_all = pd.concat(reserve_frames, ignore_index=True) if reserve_frames else pd.DataFrame()
+    train_all = sort_by_selection_score(train_all, args.selection_objective)
+    reserve_all = sort_by_selection_score(reserve_all, args.selection_objective)
+    selected = select_rolling_folds(train_all, reserve_all, splits, args.selection_objective)
     train_all.to_csv(output_dir / "rolling_train_candidate_metrics.csv", index=False)
+    reserve_all.to_csv(output_dir / "rolling_reserve_candidate_metrics.csv", index=False)
     selected.to_csv(output_dir / "rolling_selected_folds.csv", index=False)
     summary = rolling_strategy_summary(selected)
     summary.to_csv(output_dir / "rolling_strategy_summary.csv", index=False)
@@ -510,6 +517,106 @@ def run_rolling_mode(
     print(selected[[column for column in display_columns if column in selected]].to_string(index=False))
     print(f"wrote rolling walk-forward outputs to {output_dir}")
     return 0
+
+
+def evaluate_policy_window(
+    raw: pd.DataFrame,
+    policy: GatePolicy,
+    *,
+    period: str,
+    config: StrategyConfig,
+    start_year: int,
+    end_year: int,
+    benchmark: pd.DataFrame,
+    risk_free: pd.DataFrame | None,
+) -> pd.DataFrame:
+    window_config = replace(config, oos_start_year=start_year, oos_end_year=end_year)
+    gated = apply_policy(
+        raw,
+        policy,
+        oos_start_year=window_config.oos_start_year,
+        oos_end_year=window_config.oos_end_year,
+    )
+    if gated.empty:
+        return pd.DataFrame()
+    attached = attach_optional_series(gated, benchmark, risk_free)
+    perf = performance_summary(
+        attached,
+        rebalance_period=period,
+        frequency=period_frequency(period),
+        benchmark_name="SPY",
+    )
+    if perf.empty:
+        return perf
+    for key, value in yearly_excess_diagnostics(attached).items():
+        perf.loc[:, key] = value
+    return perf
+
+
+def add_candidate_split_columns(
+    metrics: pd.DataFrame,
+    candidate: Candidate,
+    policy: GatePolicy,
+    *,
+    top_n: int,
+    split,
+    phase: str,
+) -> pd.DataFrame:
+    out = metrics.copy()
+    out.insert(0, "TopN", top_n)
+    out.insert(0, "GatePolicy", policy.name)
+    out.insert(0, "Family", candidate.family)
+    out.insert(0, "Candidate", candidate.name)
+    return attach_split_columns(out, split, phase)
+
+
+def select_rolling_folds(
+    train_all: pd.DataFrame,
+    reserve_all: pd.DataFrame,
+    splits,
+    selection_objective: str,
+) -> pd.DataFrame:
+    if train_all.empty:
+        return pd.DataFrame()
+    selected_frames: list[pd.DataFrame] = []
+    key_columns = ["Candidate", "GatePolicy", "RebalancePeriod", "TopN"]
+    for split in splits:
+        fold_train = train_all.loc[train_all["Fold"].eq(split.fold)]
+        if fold_train.empty:
+            continue
+        best_train = sort_by_selection_score(fold_train, selection_objective).head(1).copy()
+        best_train.loc[:, "Phase"] = "selected_train"
+        selected_frames.append(best_train)
+        mask = reserve_all["Fold"].eq(split.fold)
+        for column in key_columns:
+            mask &= reserve_all[column].eq(best_train.iloc[0][column])
+        fold_reserve = reserve_all.loc[mask].head(1).copy()
+        if not fold_reserve.empty:
+            selected_frames.append(fold_reserve)
+    return pd.concat(selected_frames, ignore_index=True) if selected_frames else pd.DataFrame()
+
+
+def filter_rebalance_dates_for_years(
+    rebalance_dates_by_period: dict[str, list[pd.Timestamp]],
+    *,
+    return_dates: pd.Index,
+    start_year: int,
+    end_year: int,
+) -> dict[str, list[pd.Timestamp]]:
+    returns_frame = pd.DataFrame({"Date": return_dates})
+    out: dict[str, list[pd.Timestamp]] = {}
+    for period, rebalance_dates in rebalance_dates_by_period.items():
+        kept: list[pd.Timestamp] = []
+        for index, signal_date in enumerate(rebalance_dates):
+            next_date = rebalance_dates[index + 1] if index + 1 < len(rebalance_dates) else None
+            future_dates = holding_period_dates(returns_frame, signal_date, next_date)
+            if future_dates.empty:
+                continue
+            years = future_dates.year
+            if bool(((years >= start_year) & (years <= end_year)).any()):
+                kept.append(signal_date)
+        out[period] = kept
+    return out
 
 
 def attach_split_columns(

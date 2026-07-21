@@ -53,7 +53,7 @@ def objective_score(metrics: pd.DataFrame, objective: str) -> pd.Series:
     months = numeric(metrics, "Months")
 
     active_penalty = (0.65 - active_share).clip(lower=0.0).fillna(0.10)
-    sample_penalty = ((60.0 - months).clip(lower=0.0) / 60.0).fillna(0.0)
+    sample_penalty = ((180.0 - months).clip(lower=0.0) / 180.0).fillna(1.0)
     return (
         simple_alpha.fillna(-np.inf)
         + 0.03 * information_ratio.fillna(0.0)
@@ -62,7 +62,7 @@ def objective_score(metrics: pd.DataFrame, objective: str) -> pd.Series:
         + 0.18 * worst_excess_year.fillna(0.0)
         + 0.12 * max_drawdown.fillna(-1.0)
         - 0.08 * active_penalty
-        - 0.05 * sample_penalty
+        - 1.00 * sample_penalty
     )
 
 

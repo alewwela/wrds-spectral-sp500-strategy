@@ -75,6 +75,27 @@ def test_robust_objective_can_rank_stable_alpha_above_max_alpha() -> None:
     assert ranked.iloc[0]["Candidate"] == "stable"
 
 
+def test_robust_objective_penalizes_sparse_month_coverage() -> None:
+    metrics = pd.DataFrame(
+        {
+            "Candidate": ["sparse", "covered"],
+            "SimpleAlphaAnnualized": [0.95, 0.30],
+            "CAGR": [1.10, 0.40],
+            "Sharpe": [1.4, 0.9],
+            "InformationRatio": [1.2, 0.8],
+            "MaxDrawdown": [-0.25, -0.35],
+            "WorstExcessYear": [0.05, -0.10],
+            "ExcessYearWinRate": [1.00, 0.75],
+            "ActiveShare": [1.00, 1.00],
+            "Months": [22, 194],
+        }
+    )
+
+    ranked = sort_by_selection_score(metrics, "robust_alpha")
+
+    assert ranked.iloc[0]["Candidate"] == "covered"
+
+
 def test_rolling_year_splits_reserve_future_years() -> None:
     splits = rolling_year_splits(
         start_year=2001,
