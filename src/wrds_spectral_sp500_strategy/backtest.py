@@ -30,6 +30,7 @@ from wrds_spectral_sp500_strategy.performance import (
     performance_summary,
     yearly_returns,
 )
+from wrds_spectral_sp500_strategy.portfolio import portfolio_weights
 from wrds_spectral_sp500_strategy.rebalance import (
     holding_period_dates,
     period_frequency,
@@ -143,6 +144,10 @@ def run_backtests(config: StrategyConfig) -> BacktestOutputs:
         date: group.drop_duplicates("PERMNO").set_index("PERMNO")["AdjReturn"].astype(float)
         for date, group in returns.groupby("Date")
     }
+    benchmark_metrics_by_signal = {
+        date: benchmark_signal_metrics(benchmark, date)
+        for date in unique_rebalance_dates
+    }
 
     signal_cache: dict[pd.Timestamp, SignalResult] = {}
     audit_rows: list[dict[str, object]] = []
@@ -181,6 +186,7 @@ def run_backtests(config: StrategyConfig) -> BacktestOutputs:
             signal_cache=signal_cache,
             returns_by_date=returns_by_date,
             return_dates=return_dates,
+            benchmark_metrics_by_signal=benchmark_metrics_by_signal,
         )
         raw.to_csv(period_dir / "raw_returns.csv", index=False)
         gated, thresholds = apply_expanding_gate(
@@ -325,7 +331,12 @@ def build_signal(
         .rename(columns={"index": "PERMNO"})
     )
     holdings.loc[:, "SignalDate"] = signal_date
-    holdings.loc[:, "Weight"] = 1.0 / config.top_n
+    weights = portfolio_weights(
+        selected,
+        weighting=config.portfolio_weighting,
+        rank_decay=config.rank_decay,
+    )
+    holdings.loc[:, "Weight"] = holdings["PERMNO"].map(weights)
     if not mapped_frame.empty:
         holdings = holdings.merge(
             mapped_frame[
@@ -396,6 +407,7 @@ def build_raw_returns_for_period(
     signal_cache: dict[pd.Timestamp, SignalResult],
     returns_by_date: dict[pd.Timestamp, pd.Series],
     return_dates: pd.Index,
+    benchmark_metrics_by_signal: dict[pd.Timestamp, dict[str, float]],
 ) -> pd.DataFrame:
     rows: list[dict[str, object]] = []
     for index, signal_date in enumerate(rebalance_dates):
@@ -411,6 +423,11 @@ def build_raw_returns_for_period(
         if future_dates.empty:
             continue
         selected = signal.selected
+        weights = portfolio_weights(
+            selected,
+            weighting=config.portfolio_weighting,
+            rank_decay=config.rank_decay,
+        )
         for return_date in future_dates:
             date_returns = returns_by_date.get(return_date)
             if date_returns is None:
@@ -423,6 +440,7 @@ def build_raw_returns_for_period(
                     selected_returns = selected_returns.dropna()
             if selected_returns.empty:
                 continue
+            aligned_weights = weights.reindex(selected_returns.index)
             rows.append(
                 {
                     "RebalancePeriod": period,
@@ -430,7 +448,9 @@ def build_raw_returns_for_period(
                     "SignalDate": signal_date,
                     "SourceSnapshotDate": signal.source_snapshot_date,
                     "Date": return_date,
-                    "RawPortfolioReturn": float(selected_returns.sum() / config.top_n),
+                    "RawPortfolioReturn": float(
+                        selected_returns.mul(aligned_weights).sum()
+                    ),
                     "RawActiveNames": config.top_n,
                     "RawUniverseCount": signal.raw_universe_count,
                     "MappedUniverseCount": signal.mapped_universe_count,
@@ -442,6 +462,7 @@ def build_raw_returns_for_period(
                     "median_ret_horizon_worst_60m": metric_median(
                         signal.score_inputs, "ret_horizon_worst_60m"
                     ),
+                    **benchmark_metrics_by_signal.get(signal_date, {}),
                 }
             )
     return pd.DataFrame(rows)
@@ -451,6 +472,27 @@ def metric_median(frame: pd.DataFrame, column: str) -> float:
     if frame.empty or column not in frame:
         return np.nan
     return float(frame[column].median(skipna=True))
+
+
+def benchmark_signal_metrics(
+    benchmark: pd.DataFrame,
+    signal_date: pd.Timestamp,
+) -> dict[str, float]:
+    return {
+        f"bench_{months}m": trailing_benchmark_return(benchmark, signal_date, months)
+        for months in (1, 3, 6, 9, 12)
+    }
+
+
+def trailing_benchmark_return(
+    benchmark: pd.DataFrame,
+    signal_date: pd.Timestamp,
+    months: int,
+) -> float:
+    past = benchmark.loc[benchmark["Date"] < signal_date, "BenchmarkReturn"].tail(months)
+    if len(past) < months:
+        return np.nan
+    return float((1.0 + past.astype(float)).prod() - 1.0)
 
 
 def cluster_residual_source_columns(weights: dict[str, float]) -> tuple[str, ...]:
@@ -506,11 +548,14 @@ def write_run_summary(
     signal_audit: pd.DataFrame,
 ) -> None:
     payload = {
-        "method": "pit_sp500_equal_weight_score_backtest",
+        "method": "pit_sp500_score_backtest",
         "top_n": config.top_n,
-        "portfolio": "long-only, unlevered, equal-weight, no shorts, no leverage",
+        "portfolio": "long-only, unlevered, no shorts, no leverage",
+        "weighting": weighting_description(config),
         "score_weights": config.score_weights,
-        "gate": config.gate.__dict__,
+        "portfolio_weighting": config.portfolio_weighting,
+        "rank_decay": config.rank_decay,
+        "gate": gate_payload(config.gate),
         "start_year": config.start_year,
         "oos_start_year": config.oos_start_year,
         "oos_end_year": config.oos_end_year,
@@ -553,7 +598,8 @@ def write_report(
         "## Setup",
         "",
         "- Universe: pinned `fja05680/sp500` PIT constituent snapshots, mapped to WRDS PERMNOs using CRSP CIZ historical audit tickers as of each signal date.",
-        f"- Portfolio: long-only, unlevered, equal-weight top {config.top_n}.",
+        f"- Portfolio: long-only, unlevered top {config.top_n}.",
+        f"- Weighting: {weighting_description(config)}",
         f"- Rebalance periods: {', '.join(config.rebalance_periods)}.",
         f"- Score weights: `{json.dumps(config.score_weights, sort_keys=True)}`, with each input cross-sectionally z-scored.",
         f"- Gate: {gate_description(config.gate)}",
@@ -657,6 +703,12 @@ def write_report(
     output_dir.joinpath("report.md").write_text("\n".join(lines), encoding="utf-8")
 
 
+def gate_payload(gate) -> dict[str, object]:
+    payload = dict(gate.__dict__)
+    payload["conditions"] = [dict(condition.__dict__) for condition in gate.conditions]
+    return payload
+
+
 def markdown_table(frame: pd.DataFrame, columns: list[str]) -> str:
     if frame is None or frame.empty:
         return "_No rows._"
@@ -686,11 +738,29 @@ def markdown_table(frame: pd.DataFrame, columns: list[str]) -> str:
 def gate_description(gate) -> str:
     if not gate.enabled:
         return "disabled; the strategy stays fully invested when a valid signal exists."
+    if gate.conditions:
+        parts = [
+            (
+                f"`{condition.metric}` {condition.operator} prior expanding "
+                f"{condition.quantile:.0%} percentile"
+            )
+            for condition in gate.conditions
+        ]
+        return "invest only when " + " and ".join(parts) + "."
     return (
         f"invest only when selected `top_score` is {gate.top_score_operator} the "
         f"prior-year expanding {gate.top_score_quantile:.0%} percentile and universe "
         f"median `ret_horizon_worst_60m` is {gate.median_worst_operator} the "
         f"prior-year expanding {gate.median_worst_quantile:.0%} percentile."
+    )
+
+
+def weighting_description(config: StrategyConfig) -> str:
+    if config.portfolio_weighting.lower().replace("-", "_") == "equal":
+        return f"equal-weight across the selected top {config.top_n} names."
+    return (
+        f"rank-decay weights across the selected top {config.top_n} names "
+        f"with decay {config.rank_decay}."
     )
 
 

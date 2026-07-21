@@ -8,8 +8,10 @@ the code points at existing local exports.
 
 ## Strategy
 
-- Long-only, unlevered, equal-weight.
+- Long-only and unlevered.
 - Top 10 stocks.
+- Default weighting is equal-weight; configs can opt into rank-decay weighting
+  while still holding all 10 selected names.
 - Rebalance periods: 3M, 6M, 1Y.
 - Benchmark: SPY monthly adjusted returns.
 - Universe: PIT S&P 500 membership from pinned `fja05680/sp500` snapshots.
@@ -51,18 +53,21 @@ Outputs are written under `outputs/current_fixed_top10_sp500/`.
 diagnostics under `outputs/tuned_sp500_alpha_search/`.
 
 The checked-in tuned example is `configs/tuned_alpha_gt15.example.yaml`. It is
-not the original fixed top-10 strategy: it changes concentration to top 3,
-uses yearly rebalancing, disables the cash gate, and scores names as:
+not the original equal-weight fixed top-10 strategy: it keeps top 10 selected
+names, uses yearly rebalancing, disables the cash gate, applies rank-decay
+portfolio weights with `rank_decay: 0.60`, and scores names as:
 
 ```text
 -0.5 * EarningsYield
 +1.0 * ret_13m
 ```
 
-On the local 2001-2025 PIT S&P 500 backtest, that in-sample tuned
-specification produced 27.25% CAGR versus 9.82% for SPY, or 17.43% simple
-annualized alpha. Treat this as data-mined research output until it survives a
-separate validation protocol.
+On the local 2001-2025 PIT S&P 500 backtest, the validated top-10 rank-decay
+specification produced 25.71% CAGR versus 9.82% for SPY, or 15.89% simple
+annualized alpha. The equal-weight top-10 searches plateaued below that target;
+the alpha target was cleared by changing the top-10 weighting scheme, not by
+finding an equal-weight top-10 rule. Treat this as data-mined research output
+until it survives a separate validation protocol.
 
 ## PIT Safety
 

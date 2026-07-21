@@ -17,9 +17,9 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from wrds_spectral_sp500_strategy.backtest import metric_median
+from wrds_spectral_sp500_strategy.backtest import benchmark_signal_metrics, metric_median
 from wrds_spectral_sp500_strategy.clustering import cluster_returns
-from wrds_spectral_sp500_strategy.config import GateConfig, StrategyConfig
+from wrds_spectral_sp500_strategy.config import GateConditionConfig, GateConfig, StrategyConfig
 from wrds_spectral_sp500_strategy.data import (
     load_benchmark,
     load_factor_frames,
@@ -36,6 +36,7 @@ from wrds_spectral_sp500_strategy.features import (
 )
 from wrds_spectral_sp500_strategy.gates import apply_expanding_gate
 from wrds_spectral_sp500_strategy.performance import attach_optional_series, performance_summary
+from wrds_spectral_sp500_strategy.portfolio import portfolio_weights
 from wrds_spectral_sp500_strategy.rebalance import (
     holding_period_dates,
     period_frequency,
@@ -197,6 +198,18 @@ def main() -> int:
     config = StrategyConfig.from_yaml(args.config)
     if args.top_n is not None:
         config = replace(config, top_n=args.top_n)
+    if args.min_history_months is not None:
+        config = replace(config, min_history_months=args.min_history_months)
+    if args.include_signal_month_return:
+        config = replace(config, include_signal_month_return=True)
+    if args.no_require_current_return:
+        config = replace(config, require_current_return=False)
+    if args.drop_missing_returns:
+        config = replace(config, missing_returns_as_cash=False)
+    if args.portfolio_weighting is not None:
+        config = replace(config, portfolio_weighting=args.portfolio_weighting)
+    if args.rank_decay is not None:
+        config = replace(config, rank_decay=args.rank_decay)
 
     returns = load_returns(config.returns_path)
     benchmark = load_benchmark(config.benchmark_path)
@@ -233,15 +246,10 @@ def main() -> int:
     start = pd.Timestamp(year=config.start_year, month=1, day=1)
     end = pd.Timestamp(config.end_date) if config.end_date else all_dates.max()
     signal_dates = list(all_dates.loc[(all_dates >= start) & (all_dates <= end)])
-    rebalance_dates_by_period = {
-        period: select_rebalance_dates(signal_dates, period)
-        for period in config.rebalance_periods
-    }
     requested_periods = tuple(period.strip().upper() for period in args.periods.split(","))
     rebalance_dates_by_period = {
-        period: dates
-        for period, dates in rebalance_dates_by_period.items()
-        if period.upper() in requested_periods
+        period: select_rebalance_dates(signal_dates, period)
+        for period in requested_periods
     }
     unique_rebalance_dates = sorted(
         {date for dates in rebalance_dates_by_period.values() for date in dates}
@@ -261,6 +269,10 @@ def main() -> int:
         include_cluster_residuals=args.include_cluster_residuals,
         factor_columns=factor_columns,
     )
+    benchmark_metrics_by_signal = {
+        date: benchmark_signal_metrics(benchmark, date)
+        for date in unique_rebalance_dates
+    }
     available_candidates = [
         candidate
         for candidate in candidates
@@ -279,6 +291,7 @@ def main() -> int:
         signal_cache,
         returns_by_date=returns_by_date,
         return_dates=return_dates,
+        benchmark_metrics_by_signal=benchmark_metrics_by_signal,
         benchmark=benchmark,
         risk_free=risk_free,
     )
@@ -352,7 +365,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--gate-set",
-        choices=("no_gate", "focused"),
+        choices=("no_gate", "focused", "regime_light", "regime"),
         default="focused",
     )
     parser.add_argument(
@@ -363,6 +376,39 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--top-count", type=int, default=200)
     parser.add_argument("--top-n", type=int, default=None)
+    parser.add_argument(
+        "--min-history-months",
+        type=int,
+        default=None,
+        help="Override the minimum trailing monthly return history required per name.",
+    )
+    parser.add_argument(
+        "--include-signal-month-return",
+        action="store_true",
+        help="Include the just-completed signal month in trailing return features.",
+    )
+    parser.add_argument(
+        "--no-require-current-return",
+        action="store_true",
+        help="Do not require a return row on the signal date before scoring a name.",
+    )
+    parser.add_argument(
+        "--drop-missing-returns",
+        action="store_true",
+        help="Drop missing holding-period returns instead of treating them as cash.",
+    )
+    parser.add_argument(
+        "--portfolio-weighting",
+        choices=("equal", "rank_decay"),
+        default=None,
+        help="Override the portfolio weighting scheme.",
+    )
+    parser.add_argument(
+        "--rank-decay",
+        type=float,
+        default=None,
+        help="Decay applied to each lower-ranked selected name for rank_decay weighting.",
+    )
     parser.add_argument(
         "--feature-set",
         choices=("return", "core", "all"),
@@ -664,6 +710,12 @@ def build_gate_policies(gate_set: str = "focused") -> list[GatePolicy]:
     policies = [GatePolicy("no_gate", None)]
     if gate_set == "no_gate":
         return policies
+    if gate_set == "regime":
+        policies.extend(regime_gate_policies())
+        return policies
+    if gate_set == "regime_light":
+        policies.extend(regime_light_gate_policies())
+        return policies
     specs = [
         ("<", 0.85, "<", 0.80),
         ("<", 0.80, "<", 0.80),
@@ -698,6 +750,116 @@ def build_gate_policies(gate_set: str = "focused") -> list[GatePolicy]:
     return policies
 
 
+def regime_light_gate_policies() -> list[GatePolicy]:
+    policies: list[GatePolicy] = []
+    for metric, quantiles in {
+        "bench_1m": (0.05, 0.10, 0.15, 0.20, 0.25),
+        "bench_3m": (0.10, 0.20, 0.30),
+        "bench_6m": (0.10, 0.20, 0.30),
+        "bench_9m": (0.10, 0.20, 0.30),
+        "bench_12m": (0.10, 0.20, 0.30),
+    }.items():
+        for quantile in quantiles:
+            policies.append(
+                GatePolicy(
+                    f"{metric}_gt_q{quantile:.2f}",
+                    gate_from_conditions(((metric, ">", quantile),)),
+                )
+            )
+    for metric in ("bench_9m", "bench_12m"):
+        for low, high in ((0.10, 0.80), (0.20, 0.85), (0.20, 0.90), (0.30, 0.90)):
+            policies.append(
+                GatePolicy(
+                    f"{metric}_range_q{low:.2f}_q{high:.2f}",
+                    gate_from_conditions(((metric, ">", low), (metric, "<", high))),
+                )
+            )
+    for score_metric in ("top_score", "spread_score"):
+        for score_quantile in (0.80, 0.85, 0.90, 0.95):
+            for bench_metric in ("bench_1m", "bench_9m", "bench_12m"):
+                for bench_quantile in (0.10, 0.20, 0.30):
+                    policies.append(
+                        GatePolicy(
+                            (
+                                f"{score_metric}_lt_q{score_quantile:.2f}_"
+                                f"{bench_metric}_gt_q{bench_quantile:.2f}"
+                            ),
+                            gate_from_conditions(
+                                (
+                                    (score_metric, "<", score_quantile),
+                                    (bench_metric, ">", bench_quantile),
+                                )
+                            ),
+                        )
+                    )
+    return policies
+
+
+def regime_gate_policies() -> list[GatePolicy]:
+    policies: list[GatePolicy] = []
+    for metric in ("bench_1m", "bench_3m", "bench_6m", "bench_9m", "bench_12m"):
+        for quantile in (0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.50):
+            policies.append(
+                GatePolicy(
+                    f"{metric}_gt_q{quantile:.2f}",
+                    gate_from_conditions(((metric, ">", quantile),)),
+                )
+            )
+        for low, high in (
+            (0.05, 0.80),
+            (0.10, 0.80),
+            (0.15, 0.85),
+            (0.20, 0.85),
+            (0.20, 0.90),
+            (0.25, 0.90),
+            (0.30, 0.95),
+        ):
+            policies.append(
+                GatePolicy(
+                    f"{metric}_range_q{low:.2f}_q{high:.2f}",
+                    gate_from_conditions(((metric, ">", low), (metric, "<", high))),
+                )
+            )
+    for score_metric in ("top_score", "spread_score", "avg_score", "tenth_score"):
+        for score_quantile in (0.70, 0.80, 0.85, 0.90, 0.95):
+            policies.append(
+                GatePolicy(
+                    f"{score_metric}_lt_q{score_quantile:.2f}",
+                    gate_from_conditions(((score_metric, "<", score_quantile),)),
+                )
+            )
+            for bench_metric in ("bench_1m", "bench_6m", "bench_9m", "bench_12m"):
+                for bench_quantile in (0.05, 0.10, 0.15, 0.20, 0.25, 0.30):
+                    policies.append(
+                        GatePolicy(
+                            (
+                                f"{score_metric}_lt_q{score_quantile:.2f}_"
+                                f"{bench_metric}_gt_q{bench_quantile:.2f}"
+                            ),
+                            gate_from_conditions(
+                                (
+                                    (score_metric, "<", score_quantile),
+                                    (bench_metric, ">", bench_quantile),
+                                )
+                            ),
+                        )
+                    )
+    return policies
+
+
+def gate_from_conditions(
+    conditions: tuple[tuple[str, str, float], ...],
+) -> GateConfig:
+    return GateConfig(
+        enabled=True,
+        train_start_year=1996,
+        conditions=tuple(
+            GateConditionConfig(metric=metric, operator=operator, quantile=quantile)
+            for metric, operator, quantile in conditions
+        ),
+    )
+
+
 def run_screen(
     config: StrategyConfig,
     candidates: list[Candidate],
@@ -707,6 +869,7 @@ def run_screen(
     *,
     returns_by_date: dict[pd.Timestamp, pd.Series],
     return_dates: pd.Index,
+    benchmark_metrics_by_signal: dict[pd.Timestamp, dict[str, float]],
     benchmark: pd.DataFrame,
     risk_free: pd.DataFrame | None,
 ) -> pd.DataFrame:
@@ -723,6 +886,7 @@ def run_screen(
                 signal_cache,
                 returns_by_date=returns_by_date,
                 return_dates=return_dates,
+                benchmark_metrics_by_signal=benchmark_metrics_by_signal,
             )
             if raw.empty:
                 continue
@@ -760,6 +924,7 @@ def build_raw_returns_for_candidate(
     *,
     returns_by_date: dict[pd.Timestamp, pd.Series],
     return_dates: pd.Index,
+    benchmark_metrics_by_signal: dict[pd.Timestamp, dict[str, float]],
 ) -> pd.DataFrame:
     rows: list[dict[str, object]] = []
     for index, signal_date in enumerate(rebalance_dates):
@@ -769,6 +934,11 @@ def build_raw_returns_for_candidate(
         selected = score_candidate(signal.scores, candidate.weights, config.top_n)
         if selected.empty:
             continue
+        weights = portfolio_weights(
+            selected,
+            weighting=config.portfolio_weighting,
+            rank_decay=config.rank_decay,
+        )
         next_date = rebalance_dates[index + 1] if index + 1 < len(rebalance_dates) else None
         future_dates = holding_period_dates(
             pd.DataFrame({"Date": return_dates}),
@@ -788,6 +958,7 @@ def build_raw_returns_for_candidate(
                 )
             if selected_returns.empty:
                 continue
+            aligned_weights = weights.reindex(selected_returns.index)
             rows.append(
                 {
                     "RebalancePeriod": period,
@@ -795,7 +966,9 @@ def build_raw_returns_for_candidate(
                     "SignalDate": signal_date,
                     "SourceSnapshotDate": signal.source_snapshot_date,
                     "Date": return_date,
-                    "RawPortfolioReturn": float(selected_returns.sum() / config.top_n),
+                    "RawPortfolioReturn": float(
+                        selected_returns.mul(aligned_weights).sum()
+                    ),
                     "RawActiveNames": config.top_n,
                     "RawUniverseCount": signal.raw_universe_count,
                     "MappedUniverseCount": signal.mapped_universe_count,
@@ -805,6 +978,7 @@ def build_raw_returns_for_candidate(
                     "tenth_score": float(selected.min()),
                     "spread_score": float(selected.max() - selected.min()),
                     "median_ret_horizon_worst_60m": signal.median_worst_60m,
+                    **benchmark_metrics_by_signal.get(signal_date, {}),
                 }
             )
     return pd.DataFrame(rows)
@@ -877,8 +1051,14 @@ def write_tuned_config(
     raw = yaml.safe_load((ROOT / "configs" / "local.example.yaml").read_text(encoding="utf-8"))
     raw["rebalance_periods"] = [period]
     raw["top_n"] = config.top_n
+    raw["min_history_months"] = config.min_history_months
+    raw["include_signal_month_return"] = config.include_signal_month_return
+    raw["require_current_return"] = config.require_current_return
+    raw["missing_returns_as_cash"] = config.missing_returns_as_cash
+    raw["portfolio_weighting"] = config.portfolio_weighting
+    raw["rank_decay"] = config.rank_decay
     raw["score_weights"] = candidate.weights
-    raw["output_dir"] = "../outputs/tuned_sp500_alpha_gt15"
+    raw["output_dir"] = "../outputs/tuned_sp500_top10_alpha_gt15"
     if policy.gate is None:
         raw["gate"] = {
             "enabled": False,
@@ -889,10 +1069,16 @@ def write_tuned_config(
             "median_worst_operator": "<",
         }
     else:
-        raw["gate"] = policy.gate.__dict__
+        raw["gate"] = gate_yaml_payload(policy.gate)
     tuned_path = output_dir / "tuned_config.example.yaml"
     tuned_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
     return tuned_path
+
+
+def gate_yaml_payload(gate: GateConfig) -> dict[str, object]:
+    payload = dict(gate.__dict__)
+    payload["conditions"] = [dict(condition.__dict__) for condition in gate.conditions]
+    return payload
 
 
 def write_report(

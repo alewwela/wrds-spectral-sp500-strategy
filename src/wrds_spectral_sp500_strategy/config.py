@@ -19,6 +19,13 @@ DEFAULT_SCORE_WEIGHTS = {
 
 
 @dataclass(frozen=True)
+class GateConditionConfig:
+    metric: str
+    operator: str
+    quantile: float
+
+
+@dataclass(frozen=True)
 class GateConfig:
     enabled: bool = True
     train_start_year: int = 1996
@@ -26,6 +33,7 @@ class GateConfig:
     median_worst_quantile: float = 0.80
     top_score_operator: str = "<"
     median_worst_operator: str = "<"
+    conditions: tuple[GateConditionConfig, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -52,6 +60,8 @@ class StrategyConfig:
     include_signal_month_return: bool = False
     require_current_return: bool = True
     missing_returns_as_cash: bool = True
+    portfolio_weighting: str = "equal"
+    rank_decay: float = 0.5
     n_clusters: int = 10
     nearest_neighbors: int | None = 25
     random_state: int = 7
@@ -108,6 +118,8 @@ class StrategyConfig:
             include_signal_month_return=bool(raw.get("include_signal_month_return", False)),
             require_current_return=bool(raw.get("require_current_return", True)),
             missing_returns_as_cash=bool(raw.get("missing_returns_as_cash", True)),
+            portfolio_weighting=str(raw.get("portfolio_weighting", "equal")),
+            rank_decay=float(raw.get("rank_decay", 0.5)),
             n_clusters=int(raw.get("n_clusters", 10)),
             nearest_neighbors=(
                 None if raw.get("nearest_neighbors") is None else int(raw.get("nearest_neighbors"))
@@ -126,6 +138,14 @@ class StrategyConfig:
                 median_worst_quantile=float(gate_raw.get("median_worst_quantile", 0.80)),
                 top_score_operator=str(gate_raw.get("top_score_operator", "<")),
                 median_worst_operator=str(gate_raw.get("median_worst_operator", "<")),
+                conditions=tuple(
+                    GateConditionConfig(
+                        metric=str(condition["metric"]),
+                        operator=str(condition.get("operator", "<")),
+                        quantile=float(condition["quantile"]),
+                    )
+                    for condition in gate_raw.get("conditions", []) or []
+                ),
             ),
             sp500_source=Sp500SourceConfig(
                 repo=str(source_raw.get("repo", Sp500SourceConfig.repo)),

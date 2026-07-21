@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from wrds_spectral_sp500_strategy.config import GateConfig
+from wrds_spectral_sp500_strategy.config import GateConditionConfig, GateConfig
 
 
 def apply_expanding_gate(
@@ -44,6 +44,13 @@ def apply_expanding_gate(
             ]
         )
         return frame.sort_values("Date"), thresholds
+    if gate.conditions:
+        return apply_generic_expanding_gate(
+            frame,
+            gate,
+            oos_start_year=oos_start_year,
+            oos_end_year=oos_end_year,
+        )
     out_frames: list[pd.DataFrame] = []
     threshold_rows: list[dict[str, object]] = []
     for year in range(oos_start_year, oos_end_year + 1):
@@ -102,6 +109,79 @@ def apply_expanding_gate(
         return pd.DataFrame(), pd.DataFrame(threshold_rows)
     gated = pd.concat(out_frames, ignore_index=True).sort_values("Date")
     return gated, pd.DataFrame(threshold_rows)
+
+
+def apply_generic_expanding_gate(
+    frame: pd.DataFrame,
+    gate: GateConfig,
+    *,
+    oos_start_year: int,
+    oos_end_year: int,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    conditions = tuple(gate.conditions)
+    validate_condition_columns(frame, conditions)
+    out_frames: list[pd.DataFrame] = []
+    threshold_rows: list[dict[str, object]] = []
+    metrics = ["SignalDate", *dict.fromkeys(condition.metric for condition in conditions)]
+    for year in range(oos_start_year, oos_end_year + 1):
+        train = (
+            frame.loc[frame["Date"].dt.year.between(gate.train_start_year, year - 1)]
+            .drop_duplicates("SignalDate")
+            .loc[:, metrics]
+        )
+        apply = frame.loc[frame["Date"].dt.year.eq(year)].copy()
+        if apply.empty:
+            continue
+        signal_apply = apply.drop_duplicates("SignalDate").copy()
+        gate_pass = pd.Series(True, index=signal_apply.index)
+        threshold_row: dict[str, object] = {
+            "OOSYear": year,
+            "TrainStartYear": gate.train_start_year,
+            "TrainEndYear": year - 1,
+            "GateEnabled": True,
+            "TrainSignalCount": int(len(train)),
+        }
+        for index, condition in enumerate(conditions, start=1):
+            threshold = train[condition.metric].quantile(condition.quantile)
+            values = pd.to_numeric(signal_apply[condition.metric], errors="coerce")
+            gate_pass &= compare(values, condition.operator, threshold)
+            threshold_column = f"GateThreshold{index}"
+            apply.loc[:, threshold_column] = threshold
+            threshold_row.update(
+                {
+                    f"Condition{index}Metric": condition.metric,
+                    f"Condition{index}Operator": condition.operator,
+                    f"Condition{index}Quantile": condition.quantile,
+                    f"Condition{index}Threshold": threshold,
+                }
+            )
+        gate_by_signal = pd.Series(
+            gate_pass.to_numpy(dtype=bool),
+            index=signal_apply["SignalDate"],
+        )
+        apply.loc[:, "GatePassed"] = apply["SignalDate"].map(gate_by_signal).fillna(False)
+        apply.loc[:, "PortfolioReturn"] = np.where(
+            apply["GatePassed"], apply["RawPortfolioReturn"], 0.0
+        )
+        apply.loc[:, "GrossExposure"] = np.where(apply["GatePassed"], 1.0, 0.0)
+        apply.loc[:, "NetExposure"] = np.where(apply["GatePassed"], 1.0, 0.0)
+        apply.loc[:, "ActiveNames"] = np.where(
+            apply["GatePassed"], apply["RawActiveNames"], 0
+        )
+        out_frames.append(apply)
+        threshold_rows.append(threshold_row)
+    if not out_frames:
+        return pd.DataFrame(), pd.DataFrame(threshold_rows)
+    return pd.concat(out_frames, ignore_index=True).sort_values("Date"), pd.DataFrame(threshold_rows)
+
+
+def validate_condition_columns(
+    frame: pd.DataFrame,
+    conditions: tuple[GateConditionConfig, ...],
+) -> None:
+    missing = [condition.metric for condition in conditions if condition.metric not in frame.columns]
+    if missing:
+        raise ValueError(f"Missing gate metric columns: {', '.join(missing)}")
 
 
 def compare(values: pd.Series, operator: str, threshold: float) -> pd.Series:

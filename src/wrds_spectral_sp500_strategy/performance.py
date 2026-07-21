@@ -14,13 +14,20 @@ def attach_optional_series(
     benchmark: pd.DataFrame,
     risk_free: pd.DataFrame | None,
 ) -> pd.DataFrame:
-    left = returns.copy().assign(Date=lambda frame: pd.to_datetime(frame["Date"]))
-    bench = benchmark.copy().assign(Date=lambda frame: pd.to_datetime(frame["Date"]))
+    left = datetime_date_frame(returns)
+    bench = datetime_date_frame(benchmark)
     out = left.merge(bench, on="Date", how="left")
     if risk_free is not None:
-        rf = risk_free.copy().assign(Date=lambda frame: pd.to_datetime(frame["Date"]))
+        rf = datetime_date_frame(risk_free)
         out = out.merge(rf, on="Date", how="left")
-    return out.assign(ExcessReturn=out["PortfolioReturn"] - out["BenchmarkReturn"])
+    excess = (out["PortfolioReturn"] - out["BenchmarkReturn"]).rename("ExcessReturn")
+    return pd.concat([out, excess], axis=1)
+
+
+def datetime_date_frame(frame: pd.DataFrame) -> pd.DataFrame:
+    out = frame.drop(columns=["Date"]).copy()
+    out.insert(0, "Date", pd.to_datetime(frame["Date"]).to_numpy())
+    return out
 
 
 def performance_summary(

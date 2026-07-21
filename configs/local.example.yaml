@@ -27,6 +27,8 @@ min_history_months: 60
 include_signal_month_return: false
 require_current_return: true
 missing_returns_as_cash: true
+portfolio_weighting: equal
+rank_decay: 0.5
 
 n_clusters: 10
 nearest_neighbors: 25
