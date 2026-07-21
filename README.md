@@ -53,25 +53,29 @@ Outputs are written under `outputs/current_fixed_top10_sp500/`.
 diagnostics under `outputs/tuned_sp500_alpha_search/`.
 
 The checked-in tuned example is `configs/tuned_alpha_gt15.example.yaml`. The
-latest rerun selected parameters on 2001-2024 only, reserving 2025 for a
-walk-forward test. It is not the original equal-weight fixed top-10 strategy:
-it keeps top 10 selected names, uses yearly rebalancing, disables the cash gate,
-applies rank-decay portfolio weights with `rank_decay: 0.50`, and scores names
-as:
+latest rerun selected parameters on 2001-2020 only, reserving 2021-2025 for a
+five-year walk-forward test. It is not the original equal-weight fixed top-10
+strategy: it keeps top 10 selected names, uses yearly rebalancing, applies
+rank-decay portfolio weights with `rank_decay: 0.50`, and scores names as:
 
 ```text
--0.5 * EarningsYield
-+1.0 * ret_13m
+-2.0 * ret_34m
+-1.0 * ret_32m
+-1.5 * BookEquityGrowthYoY
+-8.0 * ret_horizon_mean_36m
+-3.0 * ret_horizon_hit_9m
 ```
 
-On the 2001-2024 selection window, this specification produced 27.34% CAGR
-versus 9.49% for SPY, or 17.84% simple annualized alpha. On the untouched 2025
-reserve year, it returned 24.48% versus 17.72% for SPY, or 6.76% simple alpha.
-The equal-weight top-10 training search topped out at 11.41% simple alpha.
+The selected gate invests only when `top_score < q0.95` and
+`median_worst < q0.80` using prior-year expanding thresholds. On the 2001-2020
+selection window, this specification produced 29.43% CAGR versus 8.59% for SPY,
+or 20.84% simple annualized alpha. On the untouched 2021-2025 reserve window,
+it produced -4.12% CAGR versus 14.83% for SPY, or -18.95% simple alpha.
 
-`configs/walk_forward_holdout.example.yaml` reproduces the 2025 reserve
-evaluation. See `docs/walk_forward_2025_selection.md` for the split, search
-passes, selected strategy, and reserve result.
+`configs/walk_forward_5y_holdout.example.yaml` reproduces the 2021-2025 reserve
+evaluation. See `docs/walk_forward_2021_2025_selection.md` for the split,
+search passes, selected strategy, and reserve result. The five-year reserve did
+not validate the tuned alpha.
 
 ## PIT Safety
 
